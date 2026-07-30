@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Nexus</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='24' fill='%235865f2'/><circle cx='36' cy='46' r='9' fill='white'/><circle cx='64' cy='46' r='9' fill='white'/></svg>">
+</head>
+<body>
+
+<!-- ============================ AUTH ============================ -->
+<div id="auth" class="auth hidden">
+  <div class="auth-art">
+    <div class="auth-logo">◈ Nexus</div>
+    <h1>Where your people hang out.</h1>
+    <p>Spin up a server, drop an invite code in the group chat, and talk in
+       channels. Add friends by tag and DM them directly.</p>
+    <ul class="auth-points">
+      <li>Unlimited servers and channels</li>
+      <li>Share access with 8-character invite codes</li>
+      <li>Friend requests and private DMs</li>
+    </ul>
+  </div>
+
+  <div class="auth-panel">
+    <div class="auth-card">
+      <div class="tabs">
+        <button class="tab active" data-mode="login">Sign in</button>
+        <button class="tab" data-mode="register">Create account</button>
+      </div>
+
+      <form id="auth-form" autocomplete="on">
+        <label class="field" id="field-username">
+          <span>Username</span>
+          <input name="username" type="text" maxlength="32" autocomplete="nickname"
+                 placeholder="Alex">
+          <small>You'll get a #0000 tag so friends can find you.</small>
+        </label>
+
+        <label class="field">
+          <span>Email</span>
+          <input name="email" type="email" required autocomplete="email"
+                 placeholder="you@example.com">
+        </label>
+
+        <label class="field">
+          <span>Password</span>
+          <input name="password" type="password" required minlength="8"
+                 autocomplete="current-password" placeholder="At least 8 characters">
+        </label>
+
+        <div class="form-error" id="auth-error"></div>
+        <button class="btn primary block" type="submit" id="auth-submit">Sign in</button>
+      </form>
+
+      <p class="auth-switch">
+        <span id="auth-switch-text">Need an account?</span>
+        <button class="linkbtn" id="auth-switch-btn">Create one</button>
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ APP ============================ -->
+<div id="app" class="app hidden">
+
+  <!-- server rail -->
+  <nav class="rail">
+    <button class="rail-btn home active" id="rail-home" title="Direct messages">
+      <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
+        <path d="M12 2 2 8v13h7v-6h6v6h7V8z"/>
+      </svg>
+    </button>
+    <div class="rail-sep"></div>
+    <div id="rail-guilds" class="rail-list"></div>
+    <button class="rail-btn add" id="rail-add" title="Create a server">+</button>
+    <button class="rail-btn join" id="rail-join" title="Join with an invite code">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+        <path d="M10 17l5-5-5-5v3H3v4h7zM14 3h5a2 2 0 012 2v14a2 2 0 01-2 2h-5v-2h5V5h-5z"/>
+      </svg>
+    </button>
+  </nav>
+
+  <!-- sidebar -->
+  <aside class="sidebar">
+    <header class="sidebar-head" id="sidebar-head">
+      <span id="sidebar-title">Direct Messages</span>
+      <button class="icon-btn" id="guild-menu-btn" title="Server options" hidden>⌄</button>
+    </header>
+
+    <div class="sidebar-body" id="sidebar-body"></div>
+
+    <div class="userbar">
+      <div class="avatar" id="me-avatar"></div>
+      <div class="userbar-name">
+        <strong id="me-name">—</strong>
+        <small id="me-tag"></small>
+      </div>
+      <button class="icon-btn" id="me-settings" title="Settings">⚙</button>
+      <button class="icon-btn" id="me-logout" title="Sign out">⏻</button>
+    </div>
+  </aside>
+
+  <!-- main -->
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="back-btn" title="Back">‹</button>
+      <div class="topbar-title" id="topbar-title">
+        <span class="hash">#</span><span id="channel-name">welcome</span>
+      </div>
+      <div class="topbar-topic" id="channel-topic"></div>
+      <div class="spacer"></div>
+      <button class="icon-btn" id="invite-btn" title="Invite people" hidden>
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor">
+          <path d="M15 12a4 4 0 100-8 4 4 0 000 8zm-9-1V8H4v3H1v2h3v3h2v-3h3v-2H6zm9 3c-2.7 0-8 1.3-8 4v2h16v-2c0-2.7-5.3-4-8-4z"/>
+        </svg>
+      </button>
+      <button class="icon-btn" id="members-btn" title="Members" hidden>
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor">
+          <path d="M16 11a3 3 0 100-6 3 3 0 000 6zm-8 0a3 3 0 100-6 3 3 0 000 6zm0 2c-2.3 0-7 1.2-7 3.5V19h14v-2.5C15 14.2 10.3 13 8 13zm8 0c-.3 0-.7 0-1.1.1 1.2.8 2.1 1.9 2.1 3.4V19h6v-2.5c0-2.3-4.7-3.5-7-3.5z"/>
+        </svg>
+      </button>
+    </header>
+
+    <div class="chat">
+      <div class="messages" id="messages">
+        <div class="empty" id="messages-empty"></div>
+      </div>
+
+      <div class="composer" id="composer">
+        <textarea id="composer-input" rows="1" maxlength="2000"
+                  placeholder="Message"></textarea>
+        <button class="send-btn" id="send-btn" title="Send">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+            <path d="M2 21l21-9L2 3v7l15 2-15 2z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <!-- member list -->
+  <aside class="members" id="members-panel" hidden>
+    <div class="members-head">Members — <span id="member-count">0</span></div>
+    <div id="members-list"></div>
+  </aside>
+</div>
+
+<!-- ============================ MODALS ============================ -->
+<div class="overlay hidden" id="overlay">
+  <div class="modal" id="modal">
+    <button class="modal-close" id="modal-close">×</button>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<div class="boot" id="boot"><div class="spinner"></div></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+# Local database — never commit real accounts and messages
+data.db
+data.db-wal
+data.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Machine-local Claude Code settings
+.claude/settings.local.json
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+nohup.out
