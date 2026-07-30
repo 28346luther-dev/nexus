@@ -13,6 +13,13 @@ DB_PATH = os.environ.get("NEXUS_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data.db"
 )
 
+# Uploaded images sit next to the database by default. On Railway that means
+# they land inside the mounted volume alongside nexus.db and survive redeploys;
+# anywhere else they would be wiped with the container.
+UPLOAD_DIR = os.environ.get("NEXUS_UPLOADS") or os.path.join(
+    os.path.dirname(os.path.abspath(DB_PATH)) or ".", "uploads"
+)
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -106,6 +113,48 @@ CREATE TABLE IF NOT EXISTS read_state (
     last_read_msg   INTEGER NOT NULL DEFAULT 0,
     UNIQUE (user_id, channel_id)
 );
+
+-- Images attached to a message. `stored_name` is a random name we generate;
+-- the browser's filename is kept only for display and downloads.
+CREATE TABLE IF NOT EXISTS attachments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    stored_name   TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    mime          TEXT NOT NULL,
+    size          INTEGER NOT NULL,
+    width         INTEGER,
+    height        INTEGER,
+    created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+
+CREATE TABLE IF NOT EXISTS reactions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    emoji      TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (message_id, user_id, emoji)
+);
+CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
+
+-- Per-server custom stickers. Removing one only sets `archived`, so messages
+-- that already used it keep rendering; a partial index lets the freed name be
+-- reused straight away.
+CREATE TABLE IF NOT EXISTS stickers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL REFERENCES guilds(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    stored_name TEXT NOT NULL,
+    mime        TEXT NOT NULL,
+    creator_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at  INTEGER NOT NULL,
+    archived    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_stickers_guild ON stickers(guild_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stickers_name
+    ON stickers(guild_id, name) WHERE archived = 0;
 """
 
 COLORS = [
@@ -134,6 +183,7 @@ def init():
     parent = os.path.dirname(DB_PATH)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     conn = connect()
     with conn:
         conn.executescript(SCHEMA)
@@ -152,6 +202,19 @@ def migrate(conn):
     if "last_used" not in have:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE sessions SET last_used = created_at")
+
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    if "avatar" not in have:
+        # Stored upload name, or NULL to fall back to the coloured initial.
+        conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
+
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "sticker_id" not in have:
+        # A sticker message carries no text; the sticker is the whole message.
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN sticker_id INTEGER"
+            " REFERENCES stickers(id) ON DELETE SET NULL"
+        )
 
 
 def now():
@@ -207,6 +270,13 @@ def create_user(conn, username, email, password):
     return cur.lastrowid
 
 
+def avatar_url(row):
+    """URL of the uploaded profile picture, or None to use the initial."""
+    keys = row.keys()
+    name = row["avatar"] if "avatar" in keys else None
+    return f"/uploads/{name}" if name else None
+
+
 def public_user(row, online=False):
     return {
         "id": row["id"],
@@ -215,6 +285,7 @@ def public_user(row, online=False):
         "tag": f'{row["username"]}#{row["discriminator"]}',
         "color": row["color"],
         "bio": row["bio"] if "bio" in row.keys() else "",
+        "avatarUrl": avatar_url(row),
         "online": online,
     }
 

@@ -129,13 +129,35 @@
       </div>
 
       <div class="composer" id="composer">
-        <textarea id="composer-input" rows="1" maxlength="2000"
-                  placeholder="Message"></textarea>
-        <button class="send-btn" id="send-btn" title="Send">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
-            <path d="M2 21l21-9L2 3v7l15 2-15 2z"/>
-          </svg>
-        </button>
+        <div class="composer-box" id="composer-box">
+          <button class="composer-btn attach" id="attach-btn" title="Upload an image">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+              <path d="M11 11V5h2v6h6v2h-6v6h-2v-6H5v-2z"/>
+            </svg>
+          </button>
+          <textarea id="composer-input" rows="1" maxlength="2000"
+                    placeholder="Message"></textarea>
+          <div class="composer-tools">
+          <button class="composer-btn" id="sticker-btn" title="Stickers">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+              <path d="M5 3h14a2 2 0 012 2v8l-8 8H5a2 2 0 01-2-2V5a2 2 0 012-2zm8 17.5L20.5 13H15a2 2 0 00-2 2z"/>
+            </svg>
+          </button>
+          <button class="composer-btn" id="emoji-btn" title="Emoji">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+              <path d="M12 2a10 10 0 100 20 10 10 0 000-20zm-3.5 7a1.5 1.5 0 110 3 1.5 1.5 0 010-3zm7 0a1.5 1.5 0 110 3 1.5 1.5 0 010-3zM12 18a5.5 5.5 0 01-5-3.2h10A5.5 5.5 0 0112 18z"/>
+            </svg>
+          </button>
+          <button class="send-btn" id="send-btn" title="Send">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+              <path d="M2 21l21-9L2 3v7l15 2-15 2z"/>
+            </svg>
+          </button>
+          </div>
+        </div>
+        <input type="file" id="file-input" hidden multiple
+               accept="image/png,image/jpeg,image/gif,image/webp">
+        <div class="drop-hint" id="drop-hint">Drop images to send</div>
       </div>
     </div>
   </main>

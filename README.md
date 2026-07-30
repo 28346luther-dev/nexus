@@ -88,11 +88,16 @@ platform's health check at it.
 
 ## Environment variables
 
-| Variable   | Default            | Purpose                                            |
-|------------|--------------------|----------------------------------------------------|
-| `PORT`     | `8000`             | Port to listen on. Railway sets this for you.       |
-| `HOST`     | `0.0.0.0`          | Interface to bind.                                  |
-| `NEXUS_DB` | `./data.db`        | Database location. Point at your volume in prod.    |
+| Variable        | Default              | Purpose                                          |
+|-----------------|----------------------|--------------------------------------------------|
+| `PORT`          | `8000`               | Port to listen on. Railway sets this for you.     |
+| `HOST`          | `0.0.0.0`            | Interface to bind.                                |
+| `NEXUS_DB`      | `./data.db`          | Database location. Point at your volume in prod.  |
+| `NEXUS_UPLOADS` | next to `NEXUS_DB`   | Where uploaded images are written.                |
+
+Uploads default to an `uploads/` folder beside the database, so setting
+`NEXUS_DB=/data/nexus.db` puts images on the same Railway volume automatically —
+there is no second variable to set.
 
 ---
 
@@ -115,8 +120,31 @@ or cancelled; if two people request each other, it auto-accepts.
 
 **Direct messages** — one-to-one conversations with unread badges.
 
+**Images** — drag and drop onto the chat, paste from the clipboard, or use the
+`+` button. PNG, JPEG, GIF and WebP up to 8 MB. Click one to open it full size.
+
+**Reactions** — hover a message and pick an emoji, or click an existing pill to
+join in. Clicking your own reaction again removes it.
+
+**Custom stickers** — each server has its own set, managed by the owner under
+*Server options → Manage stickers*. Up to 50 per server, 1 MB each. Removing a
+sticker keeps it visible in messages that already used it, and frees the name.
+
+**Profile pictures** — upload one in *Settings* (⚙ next to your name), up to
+2 MB, or remove it to go back to the coloured initial.
+
 **Live updates** — a long-polling endpoint (`/api/poll`) pushes new messages
 within a few hundred milliseconds and drives unread badges and online status.
+Reactions and edits are picked up through a per-channel fingerprint, since they
+don't create new messages.
+
+### A note on uploaded files
+
+Uploads are validated by inspecting the actual bytes, not the filename or the
+declared type, and only PNG/JPEG/GIF/WebP are accepted — SVG is rejected
+deliberately, because it can carry scripts that would run on your domain. Files
+are stored under random names, served with `nosniff` and a locked content type,
+and can never be interpreted as HTML.
 
 ---
 
@@ -139,6 +167,7 @@ WebSockets and moving from SQLite to Postgres.
 |--------------------|------------------------------------------------|
 | `app.py`           | HTTP server, routing, all API endpoints        |
 | `db.py`            | Schema, migrations, password hashing           |
+| `images.py`        | Image sniffing and size checks for uploads     |
 | `static/index.html`| Page shell                                     |
 | `static/app.js`    | Entire client — vanilla JS, no build step      |
 | `static/style.css` | Styles                                         |

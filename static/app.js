@@ -14,6 +14,7 @@ const state = {
   activeChannel: null,      // channel info object
   messages: [],
   rev: '',
+  channelRev: '',           // fingerprint of the open channel (edits/reactions)
   homeTab: 'friends',       // 'friends' when no DM is open
   pollAbort: null,
   atBottom: true,
@@ -81,8 +82,22 @@ function initials(name) {
 }
 
 function avatar(user, size = '') {
-  const node = el('div', `avatar ${size}`.trim(), initials(user.username || user.name));
-  node.style.background = user.color || '#5865f2';
+  const node = el('div', `avatar ${size}`.trim());
+  if (user.avatarUrl) {
+    const img = el('img');
+    img.src = user.avatarUrl;
+    img.alt = '';
+    // If the file ever goes missing, fall back to the coloured initial.
+    img.onerror = () => {
+      img.remove();
+      node.textContent = initials(user.username || user.name);
+      node.style.background = user.color || '#5865f2';
+    };
+    node.appendChild(img);
+  } else {
+    node.textContent = initials(user.username || user.name);
+    node.style.background = user.color || '#5865f2';
+  }
   if (user.online !== undefined) node.dataset.status = user.online ? 'online' : 'offline';
   return node;
 }
@@ -420,15 +435,24 @@ function messageNode(m, grouped) {
     tag.title = stampLabel(m.editedAt);
     text.appendChild(tag);
   }
-  body.appendChild(text);
+  if (m.content) body.appendChild(text);
+
+  if (m.sticker) body.appendChild(stickerNode(m.sticker));
+  (m.attachments || []).forEach((a) => body.appendChild(attachmentNode(a)));
+  if (m.reactions && m.reactions.length) body.appendChild(reactionBar(m));
+
   node.appendChild(body);
 
   const mine = m.author.id === state.me.id;
   const guild = state.guilds.find((g) => g.id === state.activeGuildId);
   const canDelete = mine || (guild && guild.isOwner);
-  if (mine || canDelete) {
+  {
     const actions = el('div', 'msg-actions');
-    if (mine) {
+    const react = el('button', null, '☺');
+    react.title = 'Add reaction';
+    react.onclick = (e) => openEmojiPicker(e.currentTarget, (emoji) => react_(m.id, emoji));
+    actions.appendChild(react);
+    if (mine && m.content && !m.sticker) {
       const edit = el('button', null, '✎');
       edit.title = 'Edit';
       edit.onclick = () => startEdit(m, body, text);
@@ -448,6 +472,150 @@ function messageNode(m, grouped) {
     node.appendChild(actions);
   }
   return node;
+}
+
+// ------------------------------------------------------- attachments & stickers
+
+function attachmentNode(a) {
+  const wrap = el('div', 'attachment');
+  const img = el('img');
+  img.src = a.url;
+  img.alt = a.name || 'image';
+  img.loading = 'lazy';
+  // Reserve the right box before the bytes arrive so the list doesn't jump.
+  if (a.width && a.height) {
+    const scale = Math.min(1, 400 / a.height, 520 / a.width);
+    img.width = Math.round(a.width * scale);
+    img.height = Math.round(a.height * scale);
+  }
+  img.onclick = () => openLightbox(a);
+  wrap.appendChild(img);
+  return wrap;
+}
+
+function stickerNode(sticker) {
+  const wrap = el('div', 'sticker');
+  const img = el('img');
+  img.src = sticker.url;
+  img.alt = sticker.name;
+  img.title = `:${sticker.name}:`;
+  wrap.appendChild(img);
+  return wrap;
+}
+
+function openLightbox(a) {
+  const back = el('div', 'lightbox');
+  const img = el('img');
+  img.src = a.url;
+  img.alt = a.name || '';
+  back.appendChild(img);
+
+  const bar = el('div', 'lightbox-bar');
+  const open = el('a', 'linkbtn', 'Open original');
+  open.href = a.url;
+  open.target = '_blank';
+  open.rel = 'noopener noreferrer';
+  bar.append(el('span', 'muted', `${a.name || 'image'} · ${formatBytes(a.size)}`), open);
+  back.appendChild(bar);
+
+  const close = () => {
+    back.remove();
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  back.onclick = (e) => { if (e.target !== img) close(); };
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(back);
+}
+
+function formatBytes(n) {
+  if (!n) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// ------------------------------------------------------------------ reactions
+
+async function react_(messageId, emoji) {
+  try {
+    const data = await api('POST', `/api/messages/${messageId}/reactions`, { emoji });
+    const idx = state.messages.findIndex((x) => x.id === messageId);
+    if (idx >= 0) {
+      state.messages[idx] = data.message;
+      renderMessages();
+    }
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+function reactionBar(m) {
+  const bar = el('div', 'reactions');
+  m.reactions.forEach((r) => {
+    const pill = el('button', `pill ${r.me ? 'mine' : ''}`.trim());
+    pill.appendChild(el('span', 'pill-emoji', r.emoji));
+    pill.appendChild(el('span', 'pill-count', String(r.count)));
+    pill.onclick = () => react_(m.id, r.emoji);
+    pill.onmouseenter = async () => {
+      if (pill.dataset.loaded) return;
+      pill.dataset.loaded = '1';
+      try {
+        const data = await api('GET', `/api/messages/${m.id}/reactions`);
+        const names = data.reactors[r.emoji] || [];
+        pill.title = `${names.join(', ')} reacted with ${r.emoji}`;
+      } catch { /* tooltip is optional */ }
+    };
+    bar.appendChild(pill);
+  });
+
+  const add = el('button', 'pill add-pill', '＋');
+  add.title = 'Add reaction';
+  add.onclick = (e) => openEmojiPicker(e.currentTarget, (emoji) => react_(m.id, emoji));
+  bar.appendChild(add);
+  return bar;
+}
+
+// A small curated set — enough to be useful without shipping an emoji library.
+const EMOJI = [
+  '👍', '👎', '❤️', '🔥', '🎉', '😂', '😮', '😢', '😡', '🙏',
+  '👀', '✅', '❌', '💯', '🚀', '⭐', '💡', '🤔', '😎', '🥳',
+  '👋', '🙌', '💀', '🤝', '☕', '🍕', '🎵', '⚡', '🌈', '🐛',
+];
+
+let openPopover = null;
+
+function closePopover() {
+  if (openPopover) { openPopover.remove(); openPopover = null; }
+}
+
+document.addEventListener('click', (e) => {
+  if (openPopover && !openPopover.contains(e.target)
+      && !e.target.closest('[data-popover-anchor]')) {
+    closePopover();
+  }
+});
+
+function placePopover(pop, anchor) {
+  document.body.appendChild(pop);
+  const box = anchor.getBoundingClientRect();
+  const rect = pop.getBoundingClientRect();
+  let left = Math.min(box.left, window.innerWidth - rect.width - 12);
+  let top = box.top - rect.height - 8;
+  if (top < 12) top = Math.min(box.bottom + 8, window.innerHeight - rect.height - 12);
+  pop.style.left = `${Math.max(12, left)}px`;
+  pop.style.top = `${Math.max(12, top)}px`;
+}
+
+function openEmojiPicker(anchor, onPick) {
+  closePopover();
+  anchor.setAttribute('data-popover-anchor', '');
+  const pop = el('div', 'popover emoji-pop');
+  EMOJI.forEach((e) => {
+    const b = el('button', 'emoji-btn', e);
+    b.onclick = () => { onPick(e); closePopover(); };
+    pop.appendChild(b);
+  });
+  openPopover = pop;
+  placePopover(pop, anchor);
 }
 
 function startEdit(m, body, textNode) {
@@ -655,8 +823,14 @@ function openFriends() {
 
 async function openChannel(channelId) {
   state.activeChannelId = channelId;
+  state.channelRev = '';
+  closePopover();
   stopPoll();
   $('#composer').classList.remove('hidden-composer');
+  // Clear any inline height and let CSS supply the resting size. Measuring
+  // here would be wrong anyway: during boot the chat pane has no height yet
+  // and scrollHeight comes back nonsense.
+  input.style.height = '';
   setMobileView(true);
 
   try {
@@ -716,8 +890,11 @@ $('#members-btn').onclick = () =>
 const input = $('#composer-input');
 
 function autosize() {
+  // While the composer is hidden (friends view) every measurement reads 0,
+  // which would pin the box shut once it comes back. Leave it alone instead.
+  if (!input.offsetParent) return;
   input.style.height = 'auto';
-  input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+  input.style.height = `${Math.min(Math.max(input.scrollHeight, 24), 180)}px`;
 }
 input.addEventListener('input', autosize);
 
@@ -750,6 +927,173 @@ async function sendMessage() {
   }
 }
 
+function pushMessage(message) {
+  if (state.messages.some((m) => m.id === message.id)) return;
+  state.messages.push(message);
+  state.atBottom = true;
+  renderMessages();
+  scrollToBottom();
+}
+
+// -------------------------------------------------------------- attachments
+
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+const ALLOWED_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+
+$('#attach-btn').onclick = () => $('#file-input').click();
+$('#file-input').onchange = (e) => {
+  uploadFiles([...e.target.files]);
+  e.target.value = '';           // let the same file be picked again later
+};
+
+async function uploadFiles(files) {
+  if (!state.activeChannelId) return;
+  // The caption rides along with the first image only.
+  let caption = input.value.trim();
+  for (const file of files) {
+    if (!ALLOWED_TYPES.includes(file.type)) {
+      toast(`${file.name} isn't a PNG, JPEG, GIF or WebP.`, 'error');
+      continue;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      toast(`${file.name} is ${formatBytes(file.size)} — the limit is 8 MB.`, 'error');
+      continue;
+    }
+    if (caption) { input.value = ''; autosize(); }
+    const params = new URLSearchParams({ filename: file.name });
+    if (caption) params.set('caption', caption);
+    caption = '';
+
+    const chip = showUploading(file.name);
+    try {
+      const res = await fetch(
+        `/api/channels/${state.activeChannelId}/upload?${params}`,
+        { method: 'POST', body: file, credentials: 'same-origin',
+          headers: { 'Content-Type': file.type } },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+      pushMessage(data.message);
+    } catch (err) {
+      toast(err.message, 'error');
+    } finally {
+      chip.remove();
+    }
+  }
+}
+
+function showUploading(name) {
+  const chip = el('div', 'upload-chip');
+  chip.append(el('span', 'mini-spinner'), el('span', null, `Uploading ${name}…`));
+  $('#messages').appendChild(chip);
+  scrollToBottom();
+  return chip;
+}
+
+// Paste an image straight into the composer
+input.addEventListener('paste', (e) => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) {
+    e.preventDefault();
+    uploadFiles(files);
+  }
+});
+
+// Drag and drop anywhere over the chat
+(function enableDragDrop() {
+  const chat = $('.chat');
+  let depth = 0;
+  const hint = () => $('#drop-hint');
+  chat.addEventListener('dragenter', (e) => {
+    if (![...(e.dataTransfer?.types || [])].includes('Files')) return;
+    e.preventDefault();
+    depth += 1;
+    hint().classList.add('show');
+  });
+  chat.addEventListener('dragover', (e) => {
+    if ([...(e.dataTransfer?.types || [])].includes('Files')) e.preventDefault();
+  });
+  chat.addEventListener('dragleave', () => {
+    depth = Math.max(0, depth - 1);
+    if (!depth) hint().classList.remove('show');
+  });
+  chat.addEventListener('drop', (e) => {
+    if (![...(e.dataTransfer?.types || [])].includes('Files')) return;
+    e.preventDefault();
+    depth = 0;
+    hint().classList.remove('show');
+    uploadFiles([...e.dataTransfer.files]);
+  });
+})();
+
+// ----------------------------------------------------------- emoji & stickers
+
+$('#emoji-btn').onclick = (e) => {
+  openEmojiPicker(e.currentTarget, (emoji) => {
+    const at = input.selectionStart ?? input.value.length;
+    input.value = input.value.slice(0, at) + emoji + input.value.slice(at);
+    input.focus();
+    input.setSelectionRange(at + emoji.length, at + emoji.length);
+    autosize();
+  });
+};
+
+$('#sticker-btn').onclick = (e) => openStickerPicker(e.currentTarget);
+
+async function stickerSource() {
+  // In a server channel use that server's stickers; in a DM, offer every
+  // sticker from the servers you're in.
+  if (state.activeGuildId) return [state.activeGuildId];
+  return state.guilds.map((g) => g.id);
+}
+
+async function openStickerPicker(anchor) {
+  closePopover();
+  anchor.setAttribute('data-popover-anchor', '');
+  const pop = el('div', 'popover sticker-pop');
+  pop.appendChild(el('div', 'pop-title', 'Stickers'));
+  const grid = el('div', 'sticker-grid');
+  pop.appendChild(grid);
+  grid.appendChild(el('p', 'muted', 'Loading…'));
+  openPopover = pop;
+  placePopover(pop, anchor);
+
+  const guildIds = await stickerSource();
+  const all = [];
+  for (const gid of guildIds) {
+    try {
+      const data = await api('GET', `/api/guilds/${gid}/stickers`);
+      data.stickers.forEach((s) => all.push({ ...s, guildId: gid }));
+    } catch { /* skip servers we can't read */ }
+  }
+
+  grid.replaceChildren();
+  if (!all.length) {
+    grid.appendChild(el('p', 'muted',
+      state.activeGuildId
+        ? 'No stickers yet. The server owner can add them from the server menu.'
+        : 'No stickers yet — add some in one of your servers.'));
+  }
+  all.forEach((s) => {
+    const b = el('button', 'sticker-choice');
+    const img = el('img');
+    img.src = s.url;
+    img.alt = s.name;
+    b.appendChild(img);
+    b.title = s.name;
+    b.onclick = async () => {
+      closePopover();
+      try {
+        const data = await api('POST', `/api/channels/${state.activeChannelId}/messages`,
+          { stickerId: s.id });
+        pushMessage(data.message);
+      } catch (err) { toast(err.message, 'error'); }
+    };
+    grid.appendChild(b);
+  });
+  placePopover(pop, anchor);
+}
+
 // ------------------------------------------------------------------ polling
 
 function stopPoll() {
@@ -766,7 +1110,10 @@ async function startPoll() {
     const after = state.messages.length
       ? state.messages[state.messages.length - 1].id : 0;
     const params = new URLSearchParams({ rev: state.rev, after: String(after) });
-    if (state.activeChannelId) params.set('channel', String(state.activeChannelId));
+    if (state.activeChannelId) {
+      params.set('channel', String(state.activeChannelId));
+      params.set('crev', state.channelRev || '');
+    }
 
     try {
       const res = await fetch(`/api/poll?${params}`, {
@@ -793,6 +1140,16 @@ async function startPoll() {
           if (state.atBottom) scrollToBottom();
         }
       }
+      // Reactions, edits and deletions don't arrive as new messages, so when
+      // the channel fingerprint moves we redraw the visible window.
+      if (data.channelChanged && state.activeChannelId === channelAtStart) {
+        const wasRev = state.channelRev;
+        state.channelRev = data.channelRev;
+        if (wasRev) await reloadChannelMessages();
+      } else if (data.channelRev) {
+        state.channelRev = data.channelRev;
+      }
+
       const changed = data.rev !== state.rev;
       state.rev = data.rev;
       if (changed) {
@@ -810,6 +1167,23 @@ async function startPoll() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Redraw the current channel in place, keeping the scroll position. */
+async function reloadChannelMessages() {
+  const channelId = state.activeChannelId;
+  if (!channelId) return;
+  try {
+    const data = await api('GET', `/api/channels/${channelId}/messages`);
+    if (state.activeChannelId !== channelId) return;
+    const box = $('#messages');
+    const wasAtBottom = state.atBottom;
+    const offset = box.scrollHeight - box.scrollTop;
+    state.messages = data.messages;
+    renderMessages();
+    if (wasAtBottom) scrollToBottom();
+    else box.scrollTop = box.scrollHeight - offset;
+  } catch { /* the next poll will try again */ }
+}
 
 /** Second opinion before tearing the UI down: is the session actually dead? */
 async function stillSignedIn() {
@@ -960,6 +1334,10 @@ $('#guild-menu-btn').onclick = () => {
       chan.onclick = () => { close(); promptCreateChannel(guild.id); };
       stack.appendChild(chan);
 
+      const stick = el('button', 'btn', 'Manage stickers');
+      stick.onclick = () => { close(); manageStickers(guild.id); };
+      stack.appendChild(stick);
+
       const rename = el('button', 'btn', 'Rename server');
       rename.onclick = () => { close(); promptRename(guild); };
       stack.appendChild(rename);
@@ -1027,6 +1405,100 @@ function promptRename(guild) {
       } catch (err) { toast(err.message, 'error'); }
     };
     box.appendChild(form);
+  });
+}
+
+function manageStickers(guildId) {
+  openModal((box) => {
+    const guild = state.guilds.find((g) => g.id === guildId);
+    box.appendChild(el('h2', null, 'Stickers'));
+    box.appendChild(el('p', 'sub',
+      `Custom stickers for ${guild ? guild.name : 'this server'}. `
+      + 'Anyone in the server can send them. PNG, JPEG, GIF or WebP, up to 1 MB.'));
+
+    const form = el('form', 'inline-form');
+    const nameInput = el('input');
+    nameInput.placeholder = 'sticker-name';
+    nameInput.maxLength = 24;
+    nameInput.required = true;
+    const pick = el('button', 'btn', 'Choose image');
+    pick.type = 'button';
+    const file = el('input');
+    file.type = 'file';
+    file.accept = 'image/png,image/jpeg,image/gif,image/webp';
+    file.hidden = true;
+    pick.onclick = () => file.click();
+    form.append(nameInput, pick, file);
+    box.appendChild(form);
+
+    const status = el('p', 'muted');
+    status.style.margin = '8px 0 0';
+    box.appendChild(status);
+
+    const list = el('div');
+    list.style.marginTop = '16px';
+    box.appendChild(list);
+
+    async function load() {
+      list.replaceChildren();
+      try {
+        const data = await api('GET', `/api/guilds/${guildId}/stickers`);
+        if (!data.stickers.length) {
+          list.appendChild(el('p', 'muted', 'No stickers yet.'));
+          return;
+        }
+        const grid = el('div', 'sticker-manage');
+        data.stickers.forEach((s) => {
+          const cell = el('div', 'sticker-cell');
+          const img = el('img');
+          img.src = s.url;
+          img.alt = s.name;
+          cell.appendChild(img);
+          cell.appendChild(el('span', 'sticker-name', s.name));
+          const rm = el('button', 'icon-btn', '×');
+          rm.title = 'Remove sticker';
+          rm.onclick = async () => {
+            try { await api('DELETE', `/api/stickers/${s.id}`); load(); }
+            catch (err) { toast(err.message, 'error'); }
+          };
+          cell.appendChild(rm);
+          grid.appendChild(cell);
+        });
+        list.appendChild(grid);
+      } catch (err) {
+        list.appendChild(el('p', 'muted', err.message));
+      }
+    }
+
+    file.onchange = async () => {
+      const chosen = file.files[0];
+      file.value = '';
+      if (!chosen) return;
+      const name = nameInput.value.trim();
+      if (!name) { status.textContent = 'Give the sticker a name first.'; return; }
+      if (chosen.size > 1024 * 1024) {
+        status.textContent = `That image is ${formatBytes(chosen.size)} — the limit is 1 MB.`;
+        return;
+      }
+      status.textContent = 'Uploading…';
+      try {
+        const res = await fetch(
+          `/api/guilds/${guildId}/stickers?name=${encodeURIComponent(name)}`,
+          { method: 'POST', body: chosen, credentials: 'same-origin',
+            headers: { 'Content-Type': chosen.type } },
+        );
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+        nameInput.value = '';
+        status.textContent = '';
+        toast('Sticker added.', 'ok');
+        load();
+      } catch (err) {
+        status.textContent = err.message;
+      }
+    };
+
+    load();
   });
 }
 
@@ -1339,6 +1811,75 @@ $('#me-settings').onclick = () => {
     box.appendChild(el('h2', null, 'Your profile'));
     box.appendChild(el('p', 'sub', `Signed in as ${state.me.email}`));
 
+    // ---- profile picture
+    const picRow = el('div', 'pic-row');
+    let picPreview = avatar(state.me, 'xl');
+    picRow.appendChild(picPreview);
+
+    const picButtons = el('div', 'pic-buttons');
+    const picFile = el('input');
+    picFile.type = 'file';
+    picFile.accept = 'image/png,image/jpeg,image/gif,image/webp';
+    picFile.hidden = true;
+    const upload = el('button', 'btn small', 'Upload picture');
+    upload.type = 'button';
+    upload.onclick = () => picFile.click();
+    picButtons.append(upload, picFile);
+
+    const removePic = el('button', 'btn small ghost', 'Remove');
+    removePic.type = 'button';
+    removePic.hidden = !state.me.avatarUrl;
+    picButtons.appendChild(removePic);
+
+    const picStatus = el('small', 'muted');
+    picButtons.appendChild(picStatus);
+    picRow.appendChild(picButtons);
+    box.appendChild(picRow);
+
+    const refreshPic = () => {
+      const fresh = avatar(state.me, 'xl');
+      picPreview.replaceWith(fresh);
+      picPreview = fresh;
+      removePic.hidden = !state.me.avatarUrl;
+    };
+
+    picFile.onchange = async () => {
+      const chosen = picFile.files[0];
+      picFile.value = '';
+      if (!chosen) return;
+      if (chosen.size > 2 * 1024 * 1024) {
+        picStatus.textContent = `That image is ${formatBytes(chosen.size)} — the limit is 2 MB.`;
+        return;
+      }
+      picStatus.textContent = 'Uploading…';
+      try {
+        const res = await fetch('/api/me/avatar', {
+          method: 'POST', body: chosen, credentials: 'same-origin',
+          headers: { 'Content-Type': chosen.type },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+        state.me = data.user;
+        picStatus.textContent = '';
+        refreshPic();
+        renderMe();
+        renderMessages();
+        toast('Profile picture updated.', 'ok');
+      } catch (err) {
+        picStatus.textContent = err.message;
+      }
+    };
+
+    removePic.onclick = async () => {
+      try {
+        const data = await api('DELETE', '/api/me/avatar');
+        state.me = data.user;
+        refreshPic();
+        renderMe();
+        renderMessages();
+      } catch (err) { toast(err.message, 'error'); }
+    };
+
     const form = el('form');
 
     const nameLabel = el('label', 'field');
@@ -1408,10 +1949,9 @@ $('#me-logout').onclick = () => {
 };
 
 function renderMe() {
-  const box = $('#me-avatar');
-  box.textContent = initials(state.me.username);
-  box.style.background = state.me.color;
-  box.dataset.status = 'online';
+  const fresh = avatar({ ...state.me, online: true });
+  fresh.id = 'me-avatar';
+  $('#me-avatar').replaceWith(fresh);
   $('#me-name').textContent = state.me.username;
   $('#me-tag').textContent = `#${state.me.discriminator}`;
 }

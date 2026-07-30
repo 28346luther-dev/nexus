@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
 import db
+import images
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -67,11 +68,17 @@ class ClientGone(Exception):
 ROUTES = []
 
 
-def route(method, pattern):
+def route(method, pattern, raw=0):
+    """Register a handler. `raw` = byte limit for routes that take a file body.
+
+    Image uploads send the file as the entire request body rather than as
+    multipart form data — the stdlib lost its multipart parser when the cgi
+    module was removed in Python 3.13, and raw bodies are simpler anyway.
+    """
     compiled = re.compile("^" + pattern + "$")
 
     def deco(fn):
-        ROUTES.append((method, compiled, fn))
+        ROUTES.append((method, compiled, fn, raw))
         return fn
 
     return deco
@@ -80,13 +87,14 @@ def route(method, pattern):
 class Req:
     """Everything a handler needs: db connection, body, query, current user."""
 
-    def __init__(self, conn, body, query, cookies, user, handler=None):
+    def __init__(self, conn, body, query, cookies, user, handler=None, raw=b""):
         self.conn = conn
         self.body = body
         self.query = query
         self.cookies = cookies
         self.user = user
         self.handler = handler
+        self.raw = raw
         self.set_cookie = None
         self.clear_cookie = False
 
@@ -165,25 +173,91 @@ def channel_access_or_403(req, channel_id):
     return ch
 
 
+def serialize_messages(conn, rows, user_id):
+    """Serialize messages, batching attachments/reactions to avoid N+1 queries."""
+    out = [serialize_message(r) for r in rows]
+    if not out:
+        return out
+    by_id = {m["id"]: m for m in out}
+    ids = list(by_id)
+    marks = ",".join("?" * len(ids))
+
+    for a in conn.execute(
+        f"SELECT * FROM attachments WHERE message_id IN ({marks}) ORDER BY id", ids
+    ):
+        by_id[a["message_id"]]["attachments"].append({
+            "id": a["id"],
+            "url": f"/uploads/{a['stored_name']}",
+            "name": a["original_name"],
+            "mime": a["mime"],
+            "size": a["size"],
+            "width": a["width"],
+            "height": a["height"],
+        })
+
+    for r in conn.execute(
+        f"SELECT message_id, emoji, COUNT(*) c,"
+        f" SUM(CASE WHEN user_id = ? THEN 1 ELSE 0 END) mine"
+        f" FROM reactions WHERE message_id IN ({marks})"
+        f" GROUP BY message_id, emoji ORDER BY MIN(id)",
+        [user_id] + ids,
+    ):
+        by_id[r["message_id"]]["reactions"].append({
+            "emoji": r["emoji"],
+            "count": r["c"],
+            "me": bool(r["mine"]),
+        })
+
+    sticker_ids = [m["stickerId"] for m in out if m["stickerId"]]
+    if sticker_ids:
+        smarks = ",".join("?" * len(sticker_ids))
+        stickers = {
+            s["id"]: s
+            for s in conn.execute(
+                f"SELECT * FROM stickers WHERE id IN ({smarks})", sticker_ids
+            )
+        }
+        for m in out:
+            s = stickers.get(m["stickerId"])
+            if s:
+                m["sticker"] = {
+                    "id": s["id"],
+                    "name": s["name"],
+                    "url": f"/uploads/{s['stored_name']}",
+                }
+    return out
+
+
+def serialize_one(conn, message_id, user_id):
+    row = conn.execute(MESSAGE_SELECT + " WHERE m.id = ?", (message_id,)).fetchone()
+    return serialize_messages(conn, [row], user_id)[0]
+
+
 def serialize_message(row):
+    keys = row.keys()
     return {
         "id": row["id"],
         "channelId": row["channel_id"],
         "content": row["content"],
         "createdAt": row["created_at"],
         "editedAt": row["edited_at"],
+        "stickerId": row["sticker_id"] if "sticker_id" in keys else None,
+        "sticker": None,
+        "attachments": [],
+        "reactions": [],
         "author": {
             "id": row["author_id"],
             "username": row["username"],
             "discriminator": row["discriminator"],
             "tag": f'{row["username"]}#{row["discriminator"]}',
             "color": row["color"],
+            "avatarUrl": f"/uploads/{row['avatar']}" if row["avatar"] else None,
         },
     }
 
 
 MESSAGE_SELECT = """
-SELECT m.*, u.username, u.discriminator, u.color
+SELECT m.*, u.username, u.discriminator, u.color, u.avatar
 FROM messages m JOIN users u ON u.id = m.author_id
 """
 
@@ -242,6 +316,25 @@ def revision(conn, user_id):
         ).fetchone()["v"],
     ]
     return "-".join(str(p) for p in parts)
+
+
+def channel_revision(conn, channel_id):
+    """Fingerprint of one channel's visible content.
+
+    Covers edits, deletions and reactions — none of which create a new message,
+    so the message stream alone would never tell the client to redraw.
+    """
+    m = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) a, COUNT(*) b, COALESCE(MAX(edited_at), 0) c"
+        " FROM messages WHERE channel_id = ?",
+        (channel_id,),
+    ).fetchone()
+    r = conn.execute(
+        "SELECT COALESCE(MAX(rx.id), 0) a, COUNT(*) b FROM reactions rx"
+        " JOIN messages m ON m.id = rx.message_id WHERE m.channel_id = ?",
+        (channel_id,),
+    ).fetchone()
+    return f"{m['a']}.{m['b']}.{m['c']}-{r['a']}.{r['b']}"
 
 
 # ------------------------------------------------------------------ auth API
@@ -312,6 +405,7 @@ def me_payload(row):
         "email": row["email"],
         "color": row["color"],
         "bio": row["bio"],
+        "avatarUrl": db.avatar_url(row),
     }
 
 
@@ -548,6 +642,196 @@ def new_invite_code(conn):
 LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 
+# ------------------------------------------------------------- uploads API
+
+def store_upload(data, kind):
+    """Write bytes to the upload dir under a random name; return that name.
+
+    The browser's filename never touches the filesystem — we generate the name
+    and derive the extension from the sniffed format, so a file called
+    "evil.html" cannot be written or served as HTML.
+    """
+    name = f"{secrets.token_hex(16)}.{kind}"
+    path = os.path.join(db.UPLOAD_DIR, name)
+    os.makedirs(db.UPLOAD_DIR, exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return name
+
+
+def discard_upload(stored_name):
+    """Delete a stored file, ignoring the case where it is already gone.
+
+    Only used for replaced avatars — message attachments and stickers are kept
+    because old messages still point at them.
+    """
+    if not stored_name:
+        return
+    try:
+        os.remove(os.path.join(db.UPLOAD_DIR, stored_name))
+    except OSError:
+        pass
+
+
+def read_image_or_400(req, limit):
+    data = req.raw
+    if not data:
+        raise HttpError(400, "No file was uploaded.")
+    if len(data) > limit:
+        mb = limit // (1024 * 1024)
+        raise HttpError(413, f"That image is too large — the limit is {mb} MB.")
+    kind = images.sniff(data)
+    if not kind:
+        raise HttpError(400, "That file isn't a PNG, JPEG, GIF or WebP image.")
+    return data, kind
+
+
+@route("POST", r"/api/channels/(\d+)/upload", raw=images.MAX_UPLOAD)
+def api_upload_attachment(req, channel_id):
+    """Raw image bytes in the body; filename and caption come from the query.
+
+    Sending the file as the whole body avoids multipart parsing entirely —
+    handy, since the stdlib's cgi module was removed in Python 3.13.
+    """
+    req.require_auth()
+    channel_id = int(channel_id)
+    channel_access_or_403(req, channel_id)
+
+    data, kind = read_image_or_400(req, images.MAX_UPLOAD)
+    original = (req.query.get("filename", [""])[0] or f"image.{kind}")[:120]
+    caption = (req.query.get("caption", [""])[0] or "")[:MAX_MESSAGE]
+    width, height = images.dimensions(data, kind)
+    stored = store_upload(data, kind)
+
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO messages (channel_id, author_id, content, created_at)"
+            " VALUES (?,?,?,?)",
+            (channel_id, req.user["id"], caption.strip(), db.now()),
+        )
+        req.conn.execute(
+            "INSERT INTO attachments (message_id, stored_name, original_name, mime,"
+            " size, width, height, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (cur.lastrowid, stored, original, images.FORMATS[kind], len(data),
+             width, height, db.now()),
+        )
+    mark_read(req.conn, req.user["id"], channel_id, cur.lastrowid)
+    return {"message": serialize_one(req.conn, cur.lastrowid, req.user["id"])}
+
+
+@route("POST", r"/api/me/avatar", raw=images.MAX_AVATAR)
+def api_set_avatar(req):
+    """Upload a profile picture. Replaces whatever was there before."""
+    req.require_auth()
+    data, kind = read_image_or_400(req, images.MAX_AVATAR)
+    stored = store_upload(data, kind)
+
+    previous = req.conn.execute(
+        "SELECT avatar FROM users WHERE id = ?", (req.user["id"],)
+    ).fetchone()["avatar"]
+    with req.conn:
+        req.conn.execute(
+            "UPDATE users SET avatar = ? WHERE id = ?", (stored, req.user["id"])
+        )
+    discard_upload(previous)
+    row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
+    return {"user": me_payload(row)}
+
+
+@route("DELETE", r"/api/me/avatar")
+def api_clear_avatar(req):
+    """Go back to the coloured initial."""
+    req.require_auth()
+    previous = req.conn.execute(
+        "SELECT avatar FROM users WHERE id = ?", (req.user["id"],)
+    ).fetchone()["avatar"]
+    with req.conn:
+        req.conn.execute("UPDATE users SET avatar = NULL WHERE id = ?", (req.user["id"],))
+    discard_upload(previous)
+    row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
+    return {"user": me_payload(row)}
+
+
+# ------------------------------------------------------------- stickers API
+
+STICKER_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{2,24}$")
+MAX_STICKERS_PER_GUILD = 50
+
+
+@route("GET", r"/api/guilds/(\d+)/stickers")
+def api_list_stickers(req, guild_id):
+    req.require_auth()
+    guild_id = int(guild_id)
+    guild_member_or_403(req, guild_id)
+    rows = req.conn.execute(
+        "SELECT s.*, u.username FROM stickers s"
+        " LEFT JOIN users u ON u.id = s.creator_id"
+        " WHERE s.guild_id = ? AND s.archived = 0 ORDER BY s.name COLLATE NOCASE",
+        (guild_id,),
+    ).fetchall()
+    return {
+        "stickers": [
+            {
+                "id": s["id"],
+                "name": s["name"],
+                "url": f"/uploads/{s['stored_name']}",
+                "createdBy": s["username"],
+            }
+            for s in rows
+        ]
+    }
+
+
+@route("POST", r"/api/guilds/(\d+)/stickers", raw=images.MAX_STICKER)
+def api_create_sticker(req, guild_id):
+    req.require_auth()
+    guild_id = int(guild_id)
+    owner_only(req, guild_id)
+
+    name = (req.query.get("name", [""])[0] or "").strip()
+    if not STICKER_NAME_RE.match(name):
+        raise HttpError(400, "Sticker names are 2–24 characters: letters, numbers, - and _")
+
+    count = req.conn.execute(
+        "SELECT COUNT(*) c FROM stickers WHERE guild_id = ? AND archived = 0", (guild_id,)
+    ).fetchone()["c"]
+    if count >= MAX_STICKERS_PER_GUILD:
+        raise HttpError(400, f"This server already has {MAX_STICKERS_PER_GUILD} stickers.")
+
+    clash = req.conn.execute(
+        "SELECT 1 FROM stickers WHERE guild_id = ? AND name = ? AND archived = 0",
+        (guild_id, name),
+    ).fetchone()
+    if clash:
+        raise HttpError(409, f"This server already has a sticker called {name}.")
+
+    data, kind = read_image_or_400(req, images.MAX_STICKER)
+    stored = store_upload(data, kind)
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO stickers (guild_id, name, stored_name, mime, creator_id,"
+            " created_at) VALUES (?,?,?,?,?,?)",
+            (guild_id, name, stored, images.FORMATS[kind], req.user["id"], db.now()),
+        )
+    return {"sticker": {"id": cur.lastrowid, "name": name, "url": f"/uploads/{stored}"}}
+
+
+@route("DELETE", r"/api/stickers/(\d+)")
+def api_delete_sticker(req, sticker_id):
+    req.require_auth()
+    s = req.conn.execute(
+        "SELECT * FROM stickers WHERE id = ?", (int(sticker_id),)
+    ).fetchone()
+    if not s:
+        raise HttpError(404, "Sticker not found.")
+    owner_only(req, s["guild_id"])
+    # Soft delete: messages that already used this sticker keep rendering it,
+    # and the name becomes free again for a new sticker.
+    with req.conn:
+        req.conn.execute("UPDATE stickers SET archived = 1 WHERE id = ?", (s["id"],))
+    return {"ok": True}
+
+
 @route("GET", r"/api/server-info")
 def api_server_info(req):
     """Where other people should point their browser to reach this server."""
@@ -718,7 +1002,7 @@ def api_messages(req, channel_id):
             (channel_id, limit),
         ).fetchall()[::-1]
 
-    messages = [serialize_message(r) for r in rows]
+    messages = serialize_messages(req.conn, rows, req.user["id"])
     if messages:
         mark_read(req.conn, req.user["id"], channel_id, messages[-1]["id"])
     has_more = False
@@ -745,19 +1029,33 @@ def mark_read(conn, user_id, channel_id, message_id):
 def api_send_message(req, channel_id):
     req.require_auth()
     channel_id = int(channel_id)
-    channel_access_or_403(req, channel_id)
-    content = req.field("content", maxlen=MAX_MESSAGE)
+    ch = channel_access_or_403(req, channel_id)
+
+    sticker_id = req.body.get("stickerId")
+    if sticker_id:
+        sticker = req.conn.execute(
+            "SELECT * FROM stickers WHERE id = ?", (int(sticker_id),)
+        ).fetchone()
+        if not sticker:
+            raise HttpError(404, "That sticker no longer exists.")
+        # Stickers belong to a server; you must be in it to use them, and in a
+        # DM you may use stickers from any server you are a member of.
+        guild_member_or_403(req, sticker["guild_id"])
+        if ch["kind"] == "text" and ch["guild_id"] != sticker["guild_id"]:
+            raise HttpError(403, "That sticker belongs to a different server.")
+        content = ""
+    else:
+        sticker_id = None
+        content = req.field("content", maxlen=MAX_MESSAGE)
+
     with req.conn:
         cur = req.conn.execute(
-            "INSERT INTO messages (channel_id, author_id, content, created_at)"
-            " VALUES (?,?,?,?)",
-            (channel_id, req.user["id"], content, db.now()),
+            "INSERT INTO messages (channel_id, author_id, content, created_at, sticker_id)"
+            " VALUES (?,?,?,?,?)",
+            (channel_id, req.user["id"], content, db.now(), sticker_id),
         )
     mark_read(req.conn, req.user["id"], channel_id, cur.lastrowid)
-    row = req.conn.execute(
-        MESSAGE_SELECT + " WHERE m.id = ?", (cur.lastrowid,)
-    ).fetchone()
-    return {"message": serialize_message(row)}
+    return {"message": serialize_one(req.conn, cur.lastrowid, req.user["id"])}
 
 
 @route("DELETE", r"/api/messages/(\d+)")
@@ -798,8 +1096,67 @@ def api_edit_message(req, message_id):
             "UPDATE messages SET content = ?, edited_at = ? WHERE id = ?",
             (content, db.now(), msg["id"]),
         )
-    row = req.conn.execute(MESSAGE_SELECT + " WHERE m.id = ?", (msg["id"],)).fetchone()
-    return {"message": serialize_message(row)}
+    return {"message": serialize_one(req.conn, msg["id"], req.user["id"])}
+
+
+# ------------------------------------------------------------- reactions API
+
+# Reactions are stored as literal emoji characters. Cap the length so nobody
+# can stuff a paragraph into the field; a few codepoints covers flags and
+# skin-tone/ZWJ sequences.
+MAX_EMOJI_LEN = 24
+
+
+@route("POST", r"/api/messages/(\d+)/reactions")
+def api_add_reaction(req, message_id):
+    """Toggle: reacting with an emoji you already used removes it."""
+    req.require_auth()
+    msg = req.conn.execute(
+        "SELECT * FROM messages WHERE id = ?", (int(message_id),)
+    ).fetchone()
+    if not msg:
+        raise HttpError(404, "Message not found.")
+    channel_access_or_403(req, msg["channel_id"])
+
+    emoji = req.field("emoji", maxlen=MAX_EMOJI_LEN)
+    if any(c.isspace() for c in emoji):
+        raise HttpError(400, "That isn't a valid emoji.")
+
+    existing = req.conn.execute(
+        "SELECT id FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?",
+        (msg["id"], req.user["id"], emoji),
+    ).fetchone()
+    with req.conn:
+        if existing:
+            req.conn.execute("DELETE FROM reactions WHERE id = ?", (existing["id"],))
+        else:
+            req.conn.execute(
+                "INSERT INTO reactions (message_id, user_id, emoji, created_at)"
+                " VALUES (?,?,?,?)",
+                (msg["id"], req.user["id"], emoji, db.now()),
+            )
+    return {"message": serialize_one(req.conn, msg["id"], req.user["id"])}
+
+
+@route("GET", r"/api/messages/(\d+)/reactions")
+def api_list_reactors(req, message_id):
+    """Who reacted with what — powers the tooltip on a reaction pill."""
+    req.require_auth()
+    msg = req.conn.execute(
+        "SELECT * FROM messages WHERE id = ?", (int(message_id),)
+    ).fetchone()
+    if not msg:
+        raise HttpError(404, "Message not found.")
+    channel_access_or_403(req, msg["channel_id"])
+    rows = req.conn.execute(
+        "SELECT r.emoji, u.username FROM reactions r JOIN users u ON u.id = r.user_id"
+        " WHERE r.message_id = ? ORDER BY r.id",
+        (msg["id"],),
+    ).fetchall()
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r["emoji"], []).append(r["username"])
+    return {"reactors": grouped}
 
 
 @route("POST", r"/api/channels/(\d+)/read")
@@ -1042,21 +1399,34 @@ def api_poll(req):
     with req.conn:
         req.conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (db.now(), uid))
 
+    client_chan_rev = req.query.get("crev", [""])[0]
+
     deadline = time.monotonic() + POLL_TIMEOUT
     while True:
         rev = revision(req.conn, uid)
+        chan_rev = channel_revision(req.conn, channel_id) if channel_id else ""
         messages = []
         if channel_id:
             rows = req.conn.execute(
                 MESSAGE_SELECT + " WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id LIMIT 100",
                 (channel_id, after),
             ).fetchall()
-            messages = [serialize_message(r) for r in rows]
-        if messages or rev != client_rev or time.monotonic() >= deadline:
+            messages = serialize_messages(req.conn, rows, uid)
+        chan_changed = chan_rev != client_chan_rev
+        if messages or rev != client_rev or chan_changed or time.monotonic() >= deadline:
             if messages:
                 mark_read(req.conn, uid, channel_id, messages[-1]["id"])
                 rev = revision(req.conn, uid)
-            return {"messages": messages, "rev": rev, "changed": rev != client_rev}
+                chan_rev = channel_revision(req.conn, channel_id)
+            return {
+                "messages": messages,
+                "rev": rev,
+                "changed": rev != client_rev,
+                "channelRev": chan_rev,
+                # Reactions, edits and deletions don't create new messages, so
+                # the client refetches the visible window when this flips.
+                "channelChanged": chan_changed,
+            }
         time.sleep(POLL_INTERVAL)
         # The client aborts this request on every channel switch. Without
         # this check the thread would keep querying for the full timeout.
@@ -1119,6 +1489,30 @@ class Handler(BaseHTTPRequestHandler):
                 jar[name] = value
         return jar
 
+    # Absurdly large uploads aren't worth reading just to be polite about it.
+    DRAIN_CAP = 64 * 1024 * 1024
+
+    def _read_raw(self, limit):
+        """Read the body as bytes — used for image uploads."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return b""
+        if length > limit:
+            # Swallow what the client is still sending, otherwise it hits a
+            # broken pipe mid-upload and never gets to read our 413.
+            if length <= self.DRAIN_CAP:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            else:
+                self.close_connection = True
+            mb = limit // (1024 * 1024)
+            raise HttpError(413, f"That file is too large — the limit is {mb} MB.")
+        return self.rfile.read(length)
+
     def _read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -1158,6 +1552,37 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # Only names this server generated: 32 hex characters plus a known suffix.
+    UPLOAD_NAME_RE = re.compile(r"^[0-9a-f]{32}\.(png|jpg|gif|webp)$")
+
+    def _serve_upload(self, name):
+        """Serve a stored image.
+
+        The strict name pattern makes path traversal impossible, and the
+        response is pinned to the image type recorded at upload time with
+        nosniff, so a file can never be interpreted as HTML or script.
+        """
+        match = self.UPLOAD_NAME_RE.match(unquote(name))
+        if not match:
+            self._send_json(404, {"error": "Not found."})
+            return
+        full = os.path.join(db.UPLOAD_DIR, match.group(0))
+        if not os.path.isfile(full):
+            self._send_json(404, {"error": "Not found."})
+            return
+        with open(full, "rb") as fh:
+            data = fh.read()
+        self.send_response(200)
+        self.send_header("Content-Type", images.FORMATS[match.group(1)])
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Disposition", "inline")
+        self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        # Names are random and content never changes, so cache hard.
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _serve_static(self, path):
         if path == "/" or path.startswith("/invite/") or path == "/app":
             path = "/index.html"
@@ -1182,6 +1607,13 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if path.startswith("/uploads/"):
+            if method != "GET":
+                self._send_json(405, {"error": "Method not allowed."})
+            else:
+                self._serve_upload(path[len("/uploads/"):])
+            return
+
         if not path.startswith("/api/"):
             if method != "GET":
                 self._send_json(405, {"error": "Method not allowed."})
@@ -1192,7 +1624,25 @@ class Handler(BaseHTTPRequestHandler):
         conn = db.connect()
         req = None
         try:
-            body = self._read_body() if method in ("POST", "PATCH", "PUT") else {}
+            # Find the route first: it decides whether the body is JSON or a
+            # raw file. The body must be drained either way to keep the
+            # keep-alive connection in sync.
+            handler_fn = groups = None
+            raw_limit = 0
+            for m, pattern, fn, limit in ROUTES:
+                if m != method:
+                    continue
+                match = pattern.match(path)
+                if match:
+                    handler_fn, groups, raw_limit = fn, match.groups(), limit
+                    break
+
+            body, raw = {}, b""
+            if raw_limit:
+                raw = self._read_raw(raw_limit)
+            elif method in ("POST", "PATCH", "PUT"):
+                body = self._read_body()
+
             cookies = self._cookies()
             user = None
             token = cookies.get("session")
@@ -1213,19 +1663,14 @@ class Handler(BaseHTTPRequestHandler):
                                 (db.now(), token),
                             )
                         refresh_cookie = True
-            req = Req(conn, body, parse_qs(parsed.query), cookies, user, self)
+            req = Req(conn, body, parse_qs(parsed.query), cookies, user, self, raw)
             if refresh_cookie:
                 req.set_cookie = token
 
-            for m, pattern, fn in ROUTES:
-                if m != method:
-                    continue
-                match = pattern.match(path)
-                if match:
-                    result = fn(req, *match.groups())
-                    self._send_json(200, result, req)
-                    return
-            self._send_json(404, {"error": "Unknown endpoint."})
+            if handler_fn:
+                self._send_json(200, handler_fn(req, *groups), req)
+            else:
+                self._send_json(404, {"error": "Unknown endpoint."})
         except ClientGone:
             self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):

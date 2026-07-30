@@ -1,3 +1,6 @@
+# Uploaded images — user content, kept out of the repo
+uploads/
+
 # Local database — never commit real accounts and messages
 data.db
 data.db-wal
