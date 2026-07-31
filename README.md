@@ -79,6 +79,42 @@ Invite links generated inside the app automatically use this domain (the app
 reads the `X-Forwarded-Host` / `X-Forwarded-Proto` headers from Railway's
 proxy), and session cookies are marked `Secure` because Railway serves HTTPS.
 
+### Shipping updates without losing data
+
+Pushing to `main` redeploys. User data is **not** touched by a deploy, because
+it lives on the volume rather than in the container:
+
+- Accounts, servers, messages, reactions and stickers are rows in
+  `/data/nexus.db`.
+- Images sit in `/data/uploads/`.
+- Schema changes are additive — new tables use `CREATE TABLE IF NOT EXISTS`
+  and new columns are added with `ALTER TABLE ... ADD COLUMN` in `migrate()`.
+  Nothing drops or recreates an existing table.
+- Sessions survive too, so nobody gets logged out mid-conversation.
+
+Every boot prints what it found. A healthy update logs:
+
+```
+Existing data found.
+Storage: persistent volume at /data — data carries across deploys.
+```
+
+If a deploy ever logs `*** WARNING: no volume is attached. ***` or
+`Started a new, empty database.` on a site that already had users, stop and fix
+the volume before anyone signs up again — that deploy is running on throwaway
+storage.
+
+**What would actually destroy data:** detaching or deleting the volume,
+changing `NEXUS_DB` to a different path, deleting the Railway service, or a
+future migration that drops or rebuilds a table. Adding columns and tables is
+safe; renaming or removing them is not.
+
+**Back up before anything risky.** The database is one file, so:
+
+```
+railway run cat /data/nexus.db > backup-$(date +%F).db
+```
+
 ### Health check
 
 `GET /api/health` returns `{"ok": true}`; `railway.json` already points the

@@ -1701,6 +1701,41 @@ class Handler(BaseHTTPRequestHandler):
         self._handle("DELETE")
 
 
+def report_storage(existed_before):
+    """Say plainly whether this deploy is keeping data or starting empty.
+
+    On a hosted container the filesystem is replaced on every deploy, so the
+    database has to live on a mounted volume. Getting that wrong silently
+    deletes every account, which is worth shouting about in the deploy log.
+    """
+    hosted = bool(
+        os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+        or os.environ.get("RENDER")
+    )
+    volume = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    db_path = os.path.abspath(db.DB_PATH)
+
+    print(f"Database: {db_path}")
+    print(f"Uploads:  {os.path.abspath(db.UPLOAD_DIR)}")
+    print("Existing data found." if existed_before else "Started a new, empty database.")
+
+    if not hosted:
+        return
+    if not volume:
+        print("\n  *** WARNING: no volume is attached. ***")
+        print("  Everything here is deleted on the next deploy.")
+        print("  Attach a volume and set NEXUS_DB to a path inside it.")
+    elif not db_path.startswith(os.path.abspath(volume)):
+        print(f"\n  *** WARNING: the database is outside the volume ({volume}). ***")
+        print("  Everything here is deleted on the next deploy.")
+        print(f"  Set NEXUS_DB to something like {os.path.join(volume, 'nexus.db')}")
+    elif not existed_before:
+        print(f"\n  Note: the volume at {volume} was empty, so this is a fresh start.")
+    else:
+        print(f"Storage: persistent volume at {volume} — data carries across deploys.")
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     # Keep the listen backlog generous: every open tab holds a long poll.
@@ -1735,6 +1770,7 @@ def main():
     global SERVER_PORT
     SERVER_PORT = args.port
 
+    existed = os.path.exists(db.DB_PATH)
     db.init()
     server = Server((args.host, args.port), Handler)
 
@@ -1760,7 +1796,9 @@ def main():
         else:
             print("\n  Bound to this machine only — others cannot connect.")
             print("  Restart without --host 127.0.0.1 to let people in.")
-    print(f"\nDatabase: {db.DB_PATH}", flush=True)
+    print()
+    report_storage(existed)
+    print(flush=True)
 
     try:
         server.serve_forever()
