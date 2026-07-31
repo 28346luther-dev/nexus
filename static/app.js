@@ -396,12 +396,13 @@ async function renderMembers() {
     const row = el('button', `member ${m.online ? '' : 'offline'}`.trim());
     row.appendChild(avatar(m));
     row.appendChild(el('span', 'm-name', m.username));
+    if (m.isBot) row.appendChild(el('span', 'bot-tag', 'BOT'));
     if (m.isOwner) {
       const crown = el('span', 'crown', '♛');
       crown.title = 'Server owner';
       row.appendChild(crown);
     }
-    row.onclick = () => showProfile(m.id);
+    row.onclick = () => (m.isBot ? showBotPanel() : showProfile(m.id));
     list.appendChild(row);
   });
 }
@@ -435,8 +436,8 @@ function renderMessages() {
 }
 
 function messageNode(m, grouped) {
-  // A reply always shows its own header, so it never merges with the message above.
-  if (m.replyToId) grouped = false;
+  // Replies and game cards always show their own header.
+  if (m.replyToId || m.game) grouped = false;
   const node = el('div', `msg ${grouped ? 'grouped' : ''}`.trim());
   node.dataset.id = m.id;
   if (m.mentionsMe) node.classList.add('pinged');
@@ -458,6 +459,7 @@ function messageNode(m, grouped) {
     author.style.color = m.author.color;
     author.onclick = () => showProfile(m.author.id);
     head.appendChild(author);
+    if (m.author.isBot) head.appendChild(el('span', 'bot-tag', 'BOT'));
     head.appendChild(el('span', 'msg-time', stampLabel(m.createdAt)));
     body.appendChild(head);
   }
@@ -470,6 +472,7 @@ function messageNode(m, grouped) {
   }
   if (m.content) body.appendChild(text);
 
+  if (m.game) body.appendChild(gameNode(m));
   if (m.sticker) body.appendChild(stickerNode(m.sticker));
   (m.attachments || []).forEach((a) => body.appendChild(attachmentNode(a)));
   if (m.reactions && m.reactions.length) body.appendChild(reactionBar(m));
@@ -563,6 +566,131 @@ function cancelReply() {
 }
 
 $('#reply-cancel').onclick = cancelReply;
+
+// ------------------------------------------------------------ blackjack card
+
+const RED_SUITS = ['♥', '♦'];
+
+function cardNode(card) {
+  if (card === '??') {
+    const back = el('div', 'card back');
+    back.appendChild(el('span', 'card-mark', '★'));
+    return back;
+  }
+  const suit = card.slice(-1);
+  const rank = card.slice(0, -1);
+  const node = el('div', `card ${RED_SUITS.includes(suit) ? 'red' : ''}`.trim());
+  node.appendChild(el('span', 'card-tl', `${rank}${suit}`));
+  node.appendChild(el('span', 'card-mid', suit));
+  node.appendChild(el('span', 'card-br', `${rank}${suit}`));
+  return node;
+}
+
+function seatRow(seat, label, isTurn) {
+  const wrap = el('div', `seat ${isTurn ? 'active' : ''}`.trim());
+
+  const head = el('div', 'seat-head');
+  if (seat.user) head.appendChild(avatar({ ...seat.user, online: undefined }, 'xs'));
+  head.appendChild(el('span', 'seat-name', seat.user ? seat.user.username : label));
+  if (seat.total !== null) {
+    const total = el('span', 'seat-total', String(seat.total));
+    if (seat.busted) total.classList.add('bust');
+    head.appendChild(total);
+  } else {
+    head.appendChild(el('span', 'seat-total hidden-total', '?'));
+  }
+  if (seat.busted) head.appendChild(el('span', 'seat-flag bust-flag', 'BUST'));
+  else if (seat.stood) head.appendChild(el('span', 'seat-flag', 'STAND'));
+  wrap.appendChild(head);
+
+  const hand = el('div', 'hand');
+  seat.cards.forEach((c) => hand.appendChild(cardNode(c)));
+  wrap.appendChild(hand);
+  return wrap;
+}
+
+function gameNode(m) {
+  const g = m.game;
+  const card = el('div', `game-card ${g.status}`.trim());
+
+  const head = el('div', 'game-head');
+  head.appendChild(el('span', 'game-title',
+    g.mode === 'cpu' ? 'Blackjack' : 'Blackjack · 1v1'));
+  const status = el('span', 'game-status');
+  if (g.status === 'waiting') status.textContent = 'Waiting for an opponent';
+  else if (g.status === 'finished') status.textContent = 'Finished';
+  else if (g.turn) {
+    const who = g.seats[g.turn].user;
+    status.textContent = g.yourTurn ? 'Your turn'
+      : `${who ? who.username : 'Dealer'} to play`;
+  }
+  head.appendChild(status);
+  card.appendChild(head);
+
+  card.appendChild(seatRow(g.seats.host, 'Host', g.status === 'playing' && g.turn === 'host'));
+  const oppLabel = g.mode === 'cpu' ? 'Dealer' : 'Waiting…';
+  card.appendChild(seatRow(g.seats.opp, oppLabel, g.status === 'playing' && g.turn === 'opp'));
+
+  if (g.result) {
+    const banner = el('div', `game-result ${g.outcome || ''}`.trim());
+    const headline = { win: 'You won!', lose: 'You lost', push: 'Push' }[g.outcome]
+      || (g.result.winner === 'host' ? `${g.seats.host.user.username} won`
+                                     : `${g.seats.opp.user ? g.seats.opp.user.username : 'Dealer'} won`);
+    banner.appendChild(el('strong', null, headline));
+    banner.appendChild(el('span', null, g.result.text));
+    card.appendChild(banner);
+  }
+
+  const actions = el('div', 'game-actions');
+  if (g.canJoin) {
+    const join = el('button', 'btn primary small', 'Join game');
+    join.onclick = async () => {
+      join.disabled = true;
+      try {
+        const data = await api('POST', `/api/games/${g.id}/join`);
+        replaceMessage(data.message);
+      } catch (err) { toast(err.message, 'error'); join.disabled = false; }
+    };
+    actions.appendChild(join);
+  }
+  if (g.yourTurn) {
+    ['hit', 'stand'].forEach((action) => {
+      const b = el('button', `btn small ${action === 'hit' ? 'primary' : ''}`.trim(),
+        action === 'hit' ? 'Hit' : 'Stand');
+      b.onclick = async () => {
+        [...actions.querySelectorAll('button')].forEach((x) => { x.disabled = true; });
+        try {
+          const data = await api('POST', `/api/games/${g.id}/action`, { action });
+          replaceMessage(data.message);
+        } catch (err) {
+          toast(err.message, 'error');
+          [...actions.querySelectorAll('button')].forEach((x) => { x.disabled = false; });
+        }
+      };
+      actions.appendChild(b);
+    });
+  }
+  if (g.status === 'finished' && g.yourSeat !== null) {
+    const again = el('button', 'btn small ghost', 'Play again');
+    again.onclick = () => startGame(g.mode);
+    actions.appendChild(again);
+  }
+  if (actions.children.length) card.appendChild(actions);
+
+  const foot = el('div', 'game-foot');
+  const hostName = g.seats.host.user ? g.seats.host.user.username : 'someone';
+  foot.textContent = `${hostName}'s game`;
+  card.appendChild(foot);
+  return card;
+}
+
+/** Swap one message in place and redraw, keeping the scroll position. */
+function replaceMessage(message) {
+  const idx = state.messages.findIndex((x) => x.id === message.id);
+  if (idx >= 0) state.messages[idx] = message;
+  else state.messages.push(message);
+  renderMessages();
+}
 
 // ------------------------------------------------------- attachments & stickers
 
@@ -992,6 +1120,35 @@ function autosize() {
 input.addEventListener('input', autosize);
 
 input.addEventListener('keydown', (e) => {
+  // The command list takes the keys first when it's showing.
+  if (commandBox && commandMatches.length) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const step = e.key === 'ArrowDown' ? 1 : -1;
+      commandIndex = (commandIndex + step + commandMatches.length) % commandMatches.length;
+      paintCommandSelection();
+      return;
+    }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const c = commandMatches[commandIndex];
+      input.value = `${c.name} ${c.args}`;
+      autosize();
+      renderCommandBox();
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      // Run the highlighted command rather than posting a half-typed one.
+      e.preventDefault();
+      runCommand(commandMatches[commandIndex]);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeCommands();
+      return;
+    }
+  }
   // While the @ list is open it owns the arrows, Tab, Enter and Escape.
   if (mentionBox && mentionMatches.length) {
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -1027,6 +1184,18 @@ $('#send-btn').onclick = sendMessage;
 async function sendMessage() {
   const content = input.value.trim();
   if (!content || !state.activeChannelId) return;
+
+  // A leading slash runs a command rather than posting text.
+  const cmd = matchCommand(content);
+  if (cmd) {
+    if (cmd.unknown) {
+      toast(`${cmd.unknown} isn't a command. Try /blackjack.`, 'error');
+      return;
+    }
+    runCommand(cmd);
+    return;
+  }
+
   const replyTo = state.replyTo ? state.replyTo.id : null;
   input.value = '';
   autosize();
@@ -1145,6 +1314,103 @@ input.addEventListener('paste', (e) => {
     uploadFiles([...e.dataTransfer.files]);
   });
 })();
+
+// ------------------------------------------------------------ slash commands
+
+const COMMANDS = [
+  {
+    name: '/blackjack',
+    args: 'cpu',
+    summary: 'Play a hand against the Gamesman',
+    run: () => startGame('cpu'),
+  },
+  {
+    name: '/blackjack',
+    args: '1v1',
+    summary: 'Open a 1v1 anyone in the server can join',
+    run: () => startGame('pvp'),
+  },
+];
+
+async function startGame(mode) {
+  if (!state.activeChannelId) return;
+  try {
+    const data = await api('POST', `/api/channels/${state.activeChannelId}/games`,
+      { mode });
+    pushMessage(data.message);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+/** Match typed text against a command; null when it isn't one. */
+function matchCommand(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) return null;
+  const lower = trimmed.toLowerCase();
+  const exact = COMMANDS.find((c) => `${c.name} ${c.args}` === lower);
+  if (exact) return exact;
+  // "/blackjack" on its own runs the first variant.
+  const bare = COMMANDS.find((c) => c.name === lower);
+  return bare || { unknown: trimmed.split(/\s+/)[0] };
+}
+
+let commandBox = null;
+let commandMatches = [];
+let commandIndex = 0;
+
+function closeCommands() {
+  if (commandBox) { commandBox.remove(); commandBox = null; }
+  commandMatches = [];
+}
+
+function renderCommandBox() {
+  const text = input.value;
+  // Only a leading slash opens the list, and only before a newline.
+  if (!text.startsWith('/') || text.includes('\n')) return closeCommands();
+
+  const q = text.toLowerCase();
+  const matches = COMMANDS.filter((c) => `${c.name} ${c.args}`.startsWith(q)
+    || c.name.startsWith(q));
+  if (!matches.length) return closeCommands();
+
+  commandMatches = matches;
+  commandIndex = Math.min(commandIndex, matches.length - 1);
+
+  if (!commandBox) {
+    commandBox = el('div', 'popover command-pop');
+    document.body.appendChild(commandBox);
+  }
+  commandBox.replaceChildren();
+  commandBox.appendChild(el('div', 'pop-title', 'Commands'));
+  matches.forEach((c, i) => {
+    const row = el('button', `mention-row ${i === commandIndex ? 'active' : ''}`.trim());
+    row.appendChild(el('span', 'cmd-name', `${c.name} ${c.args}`));
+    row.appendChild(el('span', 'mention-tag', c.summary));
+    row.onmouseenter = () => { commandIndex = i; paintCommandSelection(); };
+    row.onclick = () => runCommand(c);
+    commandBox.appendChild(row);
+  });
+
+  const box = $('#composer-box').getBoundingClientRect();
+  commandBox.style.left = `${box.left}px`;
+  commandBox.style.width = `${Math.min(420, box.width)}px`;
+  const rect = commandBox.getBoundingClientRect();
+  commandBox.style.top = `${Math.max(12, box.top - rect.height - 8)}px`;
+}
+
+function paintCommandSelection() {
+  if (!commandBox) return;
+  [...commandBox.querySelectorAll('.mention-row')].forEach((r, i) =>
+    r.classList.toggle('active', i === commandIndex));
+}
+
+function runCommand(cmd) {
+  input.value = '';
+  autosize();
+  closeCommands();
+  cmd.run();
+}
+
+input.addEventListener('input', renderCommandBox);
 
 // --------------------------------------------------------- @ mention autocomplete
 
@@ -1944,6 +2210,41 @@ async function copyText(text) {
 }
 
 // ------------------------------------------------------------------ profiles
+
+function showBotPanel() {
+  openModal((box, close) => {
+    const head = el('div', 'profile-head');
+    const icon = el('div', 'avatar xl', 'G');
+    icon.style.background = '#3ba55d';
+    head.appendChild(icon);
+    const meta = el('div');
+    meta.appendChild(el('h2', null, 'Gamesman'));
+    meta.appendChild(el('p', 'muted', 'Deals blackjack in every server.'));
+    head.appendChild(meta);
+    box.appendChild(head);
+
+    box.appendChild(el('p', 'sub',
+      'Start a hand from the message box with a slash command, or use a button below.'));
+
+    const stack = el('div');
+    stack.style.cssText = 'display:flex;flex-direction:column;gap:8px';
+    COMMANDS.forEach((c) => {
+      const b = el('button', 'btn');
+      b.appendChild(el('strong', null, `${c.name} ${c.args}`));
+      b.appendChild(el('span', 'muted', ` — ${c.summary}`));
+      b.onclick = () => {
+        close();
+        if (!state.activeChannelId) {
+          toast('Open a channel first.', 'error');
+          return;
+        }
+        c.run();
+      };
+      stack.appendChild(b);
+    });
+    box.appendChild(stack);
+  });
+}
 
 async function showProfile(userId) {
   let user;

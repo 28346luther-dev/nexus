@@ -129,6 +129,26 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 
+-- A blackjack hand posted by the Gamesman bot. `state` is the JSON blob from
+-- blackjack.py; the message it is attached to renders it as a card.
+CREATE TABLE IF NOT EXISTS games (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+    mode       TEXT NOT NULL,        -- 'cpu' | 'pvp'
+    status     TEXT NOT NULL,        -- 'waiting' | 'playing' | 'finished'
+    host_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    guest_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    state      TEXT NOT NULL,
+    -- Bumped on every move. updated_at is only second-granularity, so two
+    -- quick actions could look identical and the other player's board
+    -- would never refresh.
+    version    INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_games_channel ON games(channel_id, id);
+
 -- Who a message pings. Written when the message is sent, so unread-mention
 -- counts stay cheap and survive the author editing the text later.
 CREATE TABLE IF NOT EXISTS mentions (
@@ -198,12 +218,56 @@ def init():
     with conn:
         conn.executescript(SCHEMA)
         migrate(conn)
+        ensure_bot(conn)
         # Drop sessions nobody has touched in a month.
         conn.execute(
             "DELETE FROM sessions WHERE last_used > 0 AND last_used < ?",
             (now() - SESSION_IDLE_TTL,),
         )
     conn.close()
+
+
+BOT_NAME = "Gamesman"
+BOT_TAG = "0000"
+BOT_EMAIL = "gamesman@nexus.bot"
+BOT_COLOR = "#3ba55d"
+
+
+def ensure_bot(conn):
+    """Create the Gamesman account and put it in every server.
+
+    It owns no password anyone can use — the hash is random bytes and login
+    refuses bot accounts outright — but it needs a real users row so its
+    messages, avatar and member-list entry work like anyone else's.
+    """
+    row = conn.execute("SELECT id FROM users WHERE email = ?", (BOT_EMAIL,)).fetchone()
+    if row:
+        bot_id = row["id"]
+    else:
+        pw_hash, salt = hash_password(secrets.token_hex(32))
+        cur = conn.execute(
+            "INSERT INTO users (username, discriminator, email, password_hash, salt,"
+            " color, bio, created_at, last_seen, is_bot)"
+            " VALUES (?,?,?,?,?,?,?,?,?,1)",
+            (BOT_NAME, BOT_TAG, BOT_EMAIL, pw_hash, salt, BOT_COLOR,
+             "Deals blackjack. Type /blackjack to play.", now(), now()),
+        )
+        bot_id = cur.lastrowid
+
+    # Join any server it isn't in yet, including ones made before it existed.
+    conn.execute(
+        "INSERT OR IGNORE INTO guild_members (guild_id, user_id, joined_at)"
+        " SELECT g.id, ?, ? FROM guilds g"
+        " WHERE NOT EXISTS (SELECT 1 FROM guild_members m"
+        "                   WHERE m.guild_id = g.id AND m.user_id = ?)",
+        (bot_id, now(), bot_id),
+    )
+    return bot_id
+
+
+def bot_id(conn):
+    row = conn.execute("SELECT id FROM users WHERE email = ?", (BOT_EMAIL,)).fetchone()
+    return row["id"] if row else None
 
 
 def migrate(conn):
@@ -217,6 +281,15 @@ def migrate(conn):
     if "avatar" not in have:
         # Stored upload name, or NULL to fall back to the coloured initial.
         conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
+    if "is_bot" not in have:
+        conn.execute("ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
+
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "game_id" not in have:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN game_id INTEGER"
+            " REFERENCES games(id) ON DELETE CASCADE"
+        )
 
     have = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
     if "sticker_id" not in have:
@@ -302,6 +375,7 @@ def public_user(row, online=False):
         "color": row["color"],
         "bio": row["bio"] if "bio" in row.keys() else "",
         "avatarUrl": avatar_url(row),
+        "isBot": bool(row["is_bot"]) if "is_bot" in row.keys() else False,
         "online": online,
     }
 

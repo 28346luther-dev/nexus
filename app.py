@@ -21,6 +21,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
+import blackjack
 import db
 import images
 
@@ -310,6 +311,18 @@ def serialize_messages(conn, rows, user_id):
             "me": bool(r["mine"]),
         })
 
+    game_ids = [m["gameId"] for m in out if m["gameId"]]
+    if game_ids:
+        gmarks = ",".join("?" * len(game_ids))
+        games = {
+            g["id"]: g
+            for g in conn.execute(f"SELECT * FROM games WHERE id IN ({gmarks})", game_ids)
+        }
+        for m in out:
+            g = games.get(m["gameId"])
+            if g:
+                m["game"] = serialize_game(conn, g, user_id)
+
     sticker_ids = [m["stickerId"] for m in out if m["stickerId"]]
     if sticker_ids:
         smarks = ",".join("?" * len(sticker_ids))
@@ -347,6 +360,8 @@ def serialize_message(row):
         "sticker": None,
         "replyToId": row["reply_to"] if "reply_to" in keys else None,
         "replyTo": None,
+        "gameId": row["game_id"] if "game_id" in keys else None,
+        "game": None,
         "mentionsMe": False,
         "attachments": [],
         "reactions": [],
@@ -357,12 +372,13 @@ def serialize_message(row):
             "tag": f'{row["username"]}#{row["discriminator"]}',
             "color": row["color"],
             "avatarUrl": f"/uploads/{row['avatar']}" if row["avatar"] else None,
+            "isBot": bool(row["is_bot"]),
         },
     }
 
 
 MESSAGE_SELECT = """
-SELECT m.*, u.username, u.discriminator, u.color, u.avatar
+SELECT m.*, u.username, u.discriminator, u.color, u.avatar, u.is_bot
 FROM messages m JOIN users u ON u.id = m.author_id
 """
 
@@ -451,7 +467,14 @@ def channel_revision(conn, channel_id):
         " JOIN messages m ON m.id = rx.message_id WHERE m.channel_id = ?",
         (channel_id,),
     ).fetchone()
-    return f"{m['a']}.{m['b']}.{m['c']}-{r['a']}.{r['b']}"
+    # Game moves rewrite a row in place without touching the message, so the
+    # board would never refresh for the other player without this.
+    g = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) a, COALESCE(SUM(version), 0) b FROM games"
+        " WHERE channel_id = ?",
+        (channel_id,),
+    ).fetchone()
+    return f"{m['a']}.{m['b']}.{m['c']}-{r['a']}.{r['b']}-{g['a']}.{g['b']}"
 
 
 # ------------------------------------------------------------------ auth API
@@ -487,6 +510,8 @@ def api_login(req):
     row = req.conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
     if not row or not db.verify_password(password, row["salt"], row["password_hash"]):
         raise HttpError(401, "Incorrect email or password.")
+    if row["is_bot"]:
+        raise HttpError(403, "That account belongs to a bot.")
     return start_session(req, row["id"])
 
 
@@ -625,6 +650,14 @@ def api_create_guild(req):
             "INSERT INTO guild_members (guild_id, user_id, joined_at) VALUES (?,?,?)",
             (gid, req.user["id"], ts),
         )
+        # Every server gets the Gamesman.
+        bot = db.bot_id(req.conn)
+        if bot:
+            req.conn.execute(
+                "INSERT OR IGNORE INTO guild_members (guild_id, user_id, joined_at)"
+                " VALUES (?,?,?)",
+                (gid, bot, ts),
+            )
         for chan in ("general", "random"):
             req.conn.execute(
                 "INSERT INTO channels (guild_id, kind, name, created_at) VALUES (?,'text',?,?)",
@@ -1495,6 +1528,195 @@ def api_open_dm(req):
     return {"channelId": cid}
 
 
+# --------------------------------------------------------------- games API
+
+def serialize_game(conn, row, viewer_id):
+    """Public view of a game, hiding what the viewer isn't allowed to see."""
+    state = json.loads(row["state"])
+    mode, status = row["mode"], row["status"]
+
+    def seat_of(uid):
+        if uid == row["host_id"]:
+            return "host"
+        if row["guest_id"] and uid == row["guest_id"]:
+            return "opp"
+        return None
+
+    viewer_seat = seat_of(viewer_id)
+    people = {}
+    for seat, uid in (("host", row["host_id"]), ("opp", row["guest_id"])):
+        if uid:
+            u = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+            people[seat] = db.public_user(u, db.is_online(u)) if u else None
+        else:
+            people[seat] = None
+    if mode == "cpu":
+        people["opp"] = {"id": None, "username": "Dealer", "color": db.BOT_COLOR,
+                         "avatarUrl": None, "isBot": True}
+
+    seats = {}
+    for seat in ("host", "opp"):
+        cards = blackjack.visible_hand(state, seat, mode, viewer_seat)
+        # The opponent's hand is dealt up front, but nobody may see it until
+        # someone actually takes the seat — otherwise you could shop for a
+        # good hand before deciding to join.
+        if seat == "opp" and status == "waiting":
+            cards = ["??"] * len(cards)
+        concealed = "??" in cards
+        seats[seat] = {
+            "user": people[seat],
+            "cards": cards,
+            # A concealed hand must not leak its total.
+            "total": None if concealed else blackjack.hand_value(state["hands"][seat]),
+            "busted": (not concealed) and blackjack.is_bust(state["hands"][seat]),
+            "stood": state["stood"][seat],
+        }
+
+    result = state.get("result")
+    outcome = None
+    if result:
+        winner = result["winner"]
+        if winner == "push":
+            outcome = "push"
+        elif viewer_seat is None:
+            outcome = "host" if winner == "host" else "opp"
+        else:
+            outcome = "win" if winner == viewer_seat else "lose"
+
+    return {
+        "id": row["id"],
+        "mode": mode,
+        "status": status,
+        "seats": seats,
+        "turn": state.get("turn"),
+        "yourSeat": viewer_seat,
+        "yourTurn": viewer_seat is not None and state.get("turn") == viewer_seat
+                    and status == "playing",
+        "canJoin": status == "waiting" and viewer_id != row["host_id"],
+        "result": result,
+        "outcome": outcome,
+    }
+
+
+def post_game_message(req, channel_id, game_id):
+    """The bot posts the card that renders the game."""
+    bot = db.bot_id(req.conn)
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO messages (channel_id, author_id, content, created_at, game_id)"
+            " VALUES (?,?,'',?,?)",
+            (channel_id, bot, db.now(), game_id),
+        )
+        req.conn.execute(
+            "UPDATE games SET message_id = ? WHERE id = ?", (cur.lastrowid, game_id)
+        )
+    return cur.lastrowid
+
+
+@route("POST", r"/api/channels/(\d+)/games")
+def api_start_game(req, channel_id):
+    req.require_auth()
+    channel_id = int(channel_id)
+    ch = channel_access_or_403(req, channel_id)
+    mode = (req.body.get("mode") or "cpu").lower()
+    if mode not in ("cpu", "pvp"):
+        raise HttpError(400, "Pick either 'cpu' or 'pvp'.")
+    if mode == "pvp" and ch["kind"] == "dm":
+        raise HttpError(400, "Open a 1v1 in a server channel so others can join.")
+
+    state = blackjack.new_game(mode)
+    if mode == "pvp":
+        # Nobody plays until an opponent joins.
+        state["turn"] = None
+        status = "waiting"
+    else:
+        status = "finished" if state["result"] else "playing"
+
+    now = db.now()
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO games (channel_id, mode, status, host_id, state,"
+            " created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (channel_id, mode, status, req.user["id"], json.dumps(state), now, now),
+        )
+    gid = cur.lastrowid
+    msg_id = post_game_message(req, channel_id, gid)
+    mark_read(req.conn, req.user["id"], channel_id, msg_id)
+    return {"message": serialize_one(req.conn, msg_id, req.user["id"])}
+
+
+def load_game(req, game_id):
+    row = req.conn.execute("SELECT * FROM games WHERE id = ?", (int(game_id),)).fetchone()
+    if not row:
+        raise HttpError(404, "That game no longer exists.")
+    channel_access_or_403(req, row["channel_id"])
+    return row
+
+
+def save_game(req, row, state, status):
+    with req.conn:
+        req.conn.execute(
+            "UPDATE games SET state = ?, status = ?, version = version + 1,"
+            " updated_at = ? WHERE id = ?",
+            (json.dumps(state), status, db.now(), row["id"]),
+        )
+    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"])}
+
+
+@route("POST", r"/api/games/(\d+)/join")
+def api_join_game(req, game_id):
+    req.require_auth()
+    row = load_game(req, game_id)
+    if row["mode"] != "pvp":
+        raise HttpError(400, "That game isn't a 1v1.")
+    if row["status"] != "waiting":
+        raise HttpError(409, "Someone already joined that game.")
+    if row["host_id"] == req.user["id"]:
+        raise HttpError(400, "You can't join your own game — wait for someone else.")
+
+    state = json.loads(row["state"])
+    state["turn"] = "host"
+    with req.conn:
+        req.conn.execute(
+            "UPDATE games SET guest_id = ?, status = 'playing', state = ?,"
+            " version = version + 1, updated_at = ? WHERE id = ? AND status = 'waiting'",
+            (req.user["id"], json.dumps(state), db.now(), row["id"]),
+        )
+    # Someone else may have won the race to join.
+    fresh = req.conn.execute("SELECT * FROM games WHERE id = ?", (row["id"],)).fetchone()
+    if fresh["guest_id"] != req.user["id"]:
+        raise HttpError(409, "Someone else joined first.")
+    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"])}
+
+
+@route("POST", r"/api/games/(\d+)/action")
+def api_game_action(req, game_id):
+    req.require_auth()
+    row = load_game(req, game_id)
+    action = (req.body.get("action") or "").lower()
+    if action not in ("hit", "stand"):
+        raise HttpError(400, "Action must be 'hit' or 'stand'.")
+    if row["status"] != "playing":
+        raise HttpError(409, "That hand isn't in play.")
+
+    seat = ("host" if req.user["id"] == row["host_id"]
+            else "opp" if row["guest_id"] and req.user["id"] == row["guest_id"] else None)
+    if seat is None:
+        raise HttpError(403, "You're not in this game.")
+
+    state = json.loads(row["state"])
+    if not blackjack.can_act(state, seat):
+        raise HttpError(409, "It isn't your turn.")
+
+    if action == "hit":
+        blackjack.hit(state, seat, row["mode"])
+    else:
+        blackjack.stand(state, seat, row["mode"])
+
+    status = "finished" if state.get("result") else "playing"
+    return save_game(req, row, state, status)
+
+
 @route("GET", r"/api/channels/(\d+)/mentionable")
 def api_mentionable(req, channel_id):
     """People you can @ in this channel — server members, or the DM partner."""
@@ -1510,9 +1732,11 @@ def api_mentionable(req, channel_id):
     else:
         rows = req.conn.execute(
             "SELECT u.* FROM guild_members m JOIN users u ON u.id = m.user_id"
-            " WHERE m.guild_id = ? ORDER BY u.username COLLATE NOCASE",
+            " WHERE m.guild_id = ? AND u.is_bot = 0"
+            " ORDER BY u.username COLLATE NOCASE",
             (ch["guild_id"],),
         ).fetchall()
+    # Bots are left out: pinging one does nothing, so suggesting it is noise.
     return {
         "users": [db.public_user(r, db.is_online(r)) for r in rows],
         "everyone": ch["kind"] != "dm",

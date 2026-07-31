@@ -444,6 +444,86 @@ button { background:none; border:0; cursor:pointer; }
 }
 .drop-hint.show { display:block; }
 
+/* -------------------------------------------------------------- blackjack */
+.bot-tag {
+  background:var(--accent); color:#fff; font-size:10px; font-weight:700;
+  letter-spacing:.4px; padding:1px 4px; border-radius:3px; flex:none;
+  text-transform:uppercase; line-height:1.4;
+}
+
+.game-card {
+  margin-top:6px; max-width:520px; background:var(--bg-1);
+  border-left:4px solid var(--accent); border-radius:6px; padding:14px 16px;
+}
+.game-card.waiting  { border-left-color:var(--yellow); }
+.game-card.finished { border-left-color:var(--text-mute); }
+
+.game-head { display:flex; align-items:baseline; gap:10px; margin-bottom:12px; }
+.game-title { font-weight:700; color:#8ea1ff; font-size:15px; }
+.game-card.waiting .game-title  { color:#f8c57a; }
+.game-card.finished .game-title { color:var(--text-dim); }
+.game-status { font-size:12.5px; color:var(--text-mute); margin-left:auto; }
+
+.seat { margin-bottom:12px; padding:6px 8px; border-radius:6px; }
+.seat.active { background:rgba(88,101,242,.10); box-shadow:inset 2px 0 0 var(--accent); }
+.seat-head { display:flex; align-items:center; gap:7px; margin-bottom:7px; }
+.seat-name {
+  font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
+  color:var(--text-dim);
+}
+.seat-total {
+  font-size:13px; font-weight:700; color:var(--text);
+  background:var(--bg-3); border-radius:10px; padding:1px 8px;
+}
+.seat-total.bust { background:rgba(237,66,69,.25); color:#ff9a9c; }
+.seat-total.hidden-total { color:var(--text-mute); }
+.seat-flag {
+  font-size:10px; font-weight:700; letter-spacing:.5px; color:var(--text-mute);
+  border:1px solid var(--line); border-radius:3px; padding:0 4px;
+}
+.seat-flag.bust-flag { color:#ff9a9c; border-color:#7a3239; }
+
+.hand { display:flex; gap:6px; flex-wrap:wrap; }
+.card {
+  width:46px; height:64px; background:#f6f6f4; color:#14151a;
+  border-radius:5px; position:relative; flex:none;
+  font-weight:700; font-size:12px; box-shadow:0 1px 3px rgba(0,0,0,.45);
+}
+.card.red { color:#c8102e; }
+.card-tl { position:absolute; top:3px; left:4px; }
+.card-br { position:absolute; bottom:3px; right:4px; transform:rotate(180deg); }
+.card-mid {
+  position:absolute; inset:0; display:grid; place-items:center; font-size:22px;
+}
+.card.back {
+  background:repeating-linear-gradient(45deg,#3b4a8f 0 5px,#2f3b73 5px 10px);
+  color:#aab4e8;
+}
+.card.back .card-mark { position:absolute; inset:0; display:grid; place-items:center; font-size:18px; }
+
+.game-result {
+  display:flex; flex-direction:column; gap:2px; margin:2px 0 12px;
+  padding:9px 12px; border-radius:6px; background:var(--bg-3); font-size:13.5px;
+}
+.game-result strong { font-size:15px; }
+.game-result.win  { background:rgba(59,165,93,.18); color:#8ce0a8; }
+.game-result.lose { background:rgba(237,66,69,.16); color:#ffa9ab; }
+.game-result.push { background:rgba(250,166,26,.16); color:#f8c57a; }
+.game-result span { color:var(--text-dim); }
+.game-result.win span, .game-result.lose span, .game-result.push span { color:inherit; opacity:.85; }
+
+.game-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.game-foot {
+  margin-top:10px; padding-top:8px; border-top:1px solid var(--line);
+  font-size:11.5px; color:var(--text-mute);
+}
+
+.command-pop { padding:6px; }
+.cmd-name {
+  font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13.5px;
+  color:var(--text);
+}
+
 /* --------------------------------------------------------------- replies */
 .avatar.xs { width:16px; height:16px; font-size:9px; }
 .avatar.xs[data-status]::after { display:none; }

@@ -156,6 +156,21 @@ or cancelled; if two people request each other, it auto-accepts.
 
 **Direct messages** — one-to-one conversations with unread badges.
 
+**Gamesman (blackjack bot)** — a bot account that joins every server
+automatically, including ones created before it existed. Start a hand from the
+message box:
+
+| Command | What it does |
+|---|---|
+| `/blackjack cpu` | Play against the dealer — hits to 17, hole card stays down until you stand |
+| `/blackjack 1v1` | Post an open table; anyone else in the server can hit **Join game** |
+
+Type `/` to see the list, arrows to choose, Enter to run. You can also click
+Gamesman in the member list. In a 1v1 the opponent's cards stay face down until
+someone actually joins, so nobody can peek at the hand before deciding. Ace
+counts as 11 or 1, closest to 21 without busting wins, and equal totals push.
+`/blackjack 1v1` needs a server channel; `cpu` works in DMs too.
+
 **Replies** — hover a message and hit ↩. The composer shows who you're
 answering (Escape cancels), and the sent reply carries a preview of the
 original — click it to jump there and the message flashes. Deleting the
@@ -215,6 +230,7 @@ WebSockets and moving from SQLite to Postgres.
 |--------------------|------------------------------------------------|
 | `app.py`           | HTTP server, routing, all API endpoints        |
 | `db.py`            | Schema, migrations, password hashing           |
+| `blackjack.py`     | Card and hand rules for the Gamesman bot       |
 | `images.py`        | Image sniffing and size checks for uploads     |
 | `static/index.html`| Page shell                                     |
 | `static/app.js`    | Entire client — vanilla JS, no build step      |
