@@ -156,6 +156,18 @@ or cancelled; if two people request each other, it auto-accepts.
 
 **Direct messages** — one-to-one conversations with unread badges.
 
+**Replies** — hover a message and hit ↩. The composer shows who you're
+answering (Escape cancels), and the sent reply carries a preview of the
+original — click it to jump there and the message flashes. Deleting the
+original leaves the reply intact, marked "Original message was deleted".
+
+**Mentions** — type `@` in the composer to get a member list; arrows or Tab and
+Enter to pick, Escape to dismiss. Mentions are stored as the full tag
+(`@Alex#0421`) so two people sharing a username never get confused, and render
+as a plain `@Alex` pill. `@everyone` pings the whole server. A message that
+mentions you gets a gold edge, and channels with unread pings show an `@` badge
+that outranks the normal unread count.
+
 **Images** — drag and drop onto the chat, paste from the clipboard, or use the
 `+` button. PNG, JPEG, GIF and WebP up to 8 MB. Click one to open it full size.
 

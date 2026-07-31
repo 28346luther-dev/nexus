@@ -173,6 +173,62 @@ def channel_access_or_403(req, channel_id):
     return ch
 
 
+# A mention is written as the author's full tag so the composer stays readable;
+# the client renders it as a plain @name. Usernames may contain spaces and dots,
+# and the four digits make it unambiguous.
+MENTION_RE = re.compile(r"@([A-Za-z0-9_.\- ]{2,32})#(\d{4})")
+EVERYONE_RE = re.compile(r"@everyone\b")
+
+
+def mention_targets(conn, channel, content, author_id):
+    """User ids pinged by this message, excluding the author."""
+    targets = set()
+    for name, disc in MENTION_RE.findall(content or ""):
+        row = conn.execute(
+            "SELECT id FROM users WHERE username = ? AND discriminator = ?",
+            (name.strip(), disc),
+        ).fetchone()
+        if row:
+            targets.add(row["id"])
+
+    if EVERYONE_RE.search(content or ""):
+        if channel["kind"] == "dm":
+            rows = conn.execute(
+                "SELECT user_id id FROM dm_participants WHERE channel_id = ?",
+                (channel["id"],),
+            )
+        else:
+            rows = conn.execute(
+                "SELECT user_id id FROM guild_members WHERE guild_id = ?",
+                (channel["guild_id"],),
+            )
+        targets.update(r["id"] for r in rows)
+
+    targets.discard(author_id)
+    # Only people who can actually see the channel get pinged.
+    return {uid for uid in targets if can_read_channel(conn, channel, uid)}
+
+
+def can_read_channel(conn, channel, user_id):
+    if channel["kind"] == "dm":
+        q = "SELECT 1 FROM dm_participants WHERE channel_id = ? AND user_id = ?"
+        args = (channel["id"], user_id)
+    else:
+        q = "SELECT 1 FROM guild_members WHERE guild_id = ? AND user_id = ?"
+        args = (channel["guild_id"], user_id)
+    return bool(conn.execute(q, args).fetchone())
+
+
+def record_mentions(conn, channel, message_id, content, author_id):
+    with conn:
+        conn.execute("DELETE FROM mentions WHERE message_id = ?", (message_id,))
+        for uid in mention_targets(conn, channel, content, author_id):
+            conn.execute(
+                "INSERT OR IGNORE INTO mentions (message_id, user_id) VALUES (?,?)",
+                (message_id, uid),
+            )
+
+
 def serialize_messages(conn, rows, user_id):
     """Serialize messages, batching attachments/reactions to avoid N+1 queries."""
     out = [serialize_message(r) for r in rows]
@@ -181,6 +237,52 @@ def serialize_messages(conn, rows, user_id):
     by_id = {m["id"]: m for m in out}
     ids = list(by_id)
     marks = ",".join("?" * len(ids))
+
+    # Which of these ping the viewer
+    for r in conn.execute(
+        f"SELECT message_id FROM mentions WHERE user_id = ? AND message_id IN ({marks})",
+        [user_id] + ids,
+    ):
+        by_id[r["message_id"]]["mentionsMe"] = True
+
+    # Replied-to previews
+    reply_ids = [m["replyToId"] for m in out if m["replyToId"]]
+    if reply_ids:
+        rmarks = ",".join("?" * len(reply_ids))
+        parents = {
+            p["id"]: p
+            for p in conn.execute(
+                "SELECT m.id, m.content, m.sticker_id, m.author_id, u.username,"
+                " u.color, u.avatar FROM messages m JOIN users u ON u.id = m.author_id"
+                f" WHERE m.id IN ({rmarks})",
+                reply_ids,
+            )
+        }
+        has_image = {
+            r["message_id"]
+            for r in conn.execute(
+                f"SELECT DISTINCT message_id FROM attachments WHERE message_id IN ({rmarks})",
+                reply_ids,
+            )
+        }
+        for m in out:
+            p = parents.get(m["replyToId"])
+            if not p:
+                continue
+            preview = p["content"]
+            if not preview:
+                preview = "sent a sticker" if p["sticker_id"] else (
+                    "sent an image" if p["id"] in has_image else "")
+            m["replyTo"] = {
+                "id": p["id"],
+                "content": preview,
+                "author": {
+                    "id": p["author_id"],
+                    "username": p["username"],
+                    "color": p["color"],
+                    "avatarUrl": f"/uploads/{p['avatar']}" if p["avatar"] else None,
+                },
+            }
 
     for a in conn.execute(
         f"SELECT * FROM attachments WHERE message_id IN ({marks}) ORDER BY id", ids
@@ -243,6 +345,9 @@ def serialize_message(row):
         "editedAt": row["edited_at"],
         "stickerId": row["sticker_id"] if "sticker_id" in keys else None,
         "sticker": None,
+        "replyToId": row["reply_to"] if "reply_to" in keys else None,
+        "replyTo": None,
+        "mentionsMe": False,
         "attachments": [],
         "reactions": [],
         "author": {
@@ -277,6 +382,18 @@ def unread_count(conn, user_id, channel_id):
         " WHERE m.channel_id = ? AND m.author_id != ?"
         "   AND m.id > COALESCE(r.last_read_msg, 0)",
         (user_id, channel_id, user_id),
+    ).fetchone()["c"]
+
+
+def mention_count(conn, user_id, channel_id):
+    """Unread pings for this user in this channel."""
+    return conn.execute(
+        "SELECT COUNT(*) c FROM mentions mn"
+        " JOIN messages m ON m.id = mn.message_id"
+        " LEFT JOIN read_state r ON r.user_id = ? AND r.channel_id = m.channel_id"
+        " WHERE mn.user_id = ? AND m.channel_id = ?"
+        "   AND m.id > COALESCE(r.last_read_msg, 0)",
+        (user_id, user_id, channel_id),
     ).fetchone()["c"]
 
 
@@ -484,6 +601,7 @@ def api_guilds(req):
                         "name": c["name"],
                         "topic": c["topic"],
                         "unread": unread_count(req.conn, uid, c["id"]),
+                        "mentions": mention_count(req.conn, uid, c["id"]),
                     }
                     for c in channels
                 ],
@@ -1048,14 +1166,32 @@ def api_send_message(req, channel_id):
         sticker_id = None
         content = req.field("content", maxlen=MAX_MESSAGE)
 
+    reply_to = resolve_reply(req, channel_id)
+
     with req.conn:
         cur = req.conn.execute(
-            "INSERT INTO messages (channel_id, author_id, content, created_at, sticker_id)"
-            " VALUES (?,?,?,?,?)",
-            (channel_id, req.user["id"], content, db.now(), sticker_id),
+            "INSERT INTO messages (channel_id, author_id, content, created_at,"
+            " sticker_id, reply_to) VALUES (?,?,?,?,?,?)",
+            (channel_id, req.user["id"], content, db.now(), sticker_id, reply_to),
         )
+    record_mentions(req.conn, ch, cur.lastrowid, content, req.user["id"])
     mark_read(req.conn, req.user["id"], channel_id, cur.lastrowid)
     return {"message": serialize_one(req.conn, cur.lastrowid, req.user["id"])}
+
+
+def resolve_reply(req, channel_id):
+    """Validate a replyTo id, or None. Replies may only target the same channel."""
+    raw = req.body.get("replyTo")
+    if not raw:
+        return None
+    parent = req.conn.execute(
+        "SELECT id, channel_id FROM messages WHERE id = ?", (int(raw),)
+    ).fetchone()
+    if not parent:
+        raise HttpError(404, "The message you replied to no longer exists.")
+    if parent["channel_id"] != channel_id:
+        raise HttpError(400, "You can only reply to a message in the same channel.")
+    return parent["id"]
 
 
 @route("DELETE", r"/api/messages/(\d+)")
@@ -1091,11 +1227,13 @@ def api_edit_message(req, message_id):
     if msg["author_id"] != req.user["id"]:
         raise HttpError(403, "You can only edit your own messages.")
     content = req.field("content", maxlen=MAX_MESSAGE)
+    ch = channel_access_or_403(req, msg["channel_id"])
     with req.conn:
         req.conn.execute(
             "UPDATE messages SET content = ?, edited_at = ? WHERE id = ?",
             (content, db.now(), msg["id"]),
         )
+    record_mentions(req.conn, ch, msg["id"], content, req.user["id"])
     return {"message": serialize_one(req.conn, msg["id"], req.user["id"])}
 
 
@@ -1315,6 +1453,7 @@ def api_dms(req):
                 "channelId": r["id"],
                 "user": db.public_user(other, db.is_online(other)),
                 "unread": unread_count(req.conn, uid, r["id"]),
+                "mentions": mention_count(req.conn, uid, r["id"]),
                 "lastMessage": last["content"] if last else None,
                 "lastAt": last["created_at"] if last else 0,
             }
@@ -1354,6 +1493,30 @@ def api_open_dm(req):
             [(cid, uid), (cid, other_id)],
         )
     return {"channelId": cid}
+
+
+@route("GET", r"/api/channels/(\d+)/mentionable")
+def api_mentionable(req, channel_id):
+    """People you can @ in this channel — server members, or the DM partner."""
+    req.require_auth()
+    channel_id = int(channel_id)
+    ch = channel_access_or_403(req, channel_id)
+    if ch["kind"] == "dm":
+        rows = req.conn.execute(
+            "SELECT u.* FROM dm_participants p JOIN users u ON u.id = p.user_id"
+            " WHERE p.channel_id = ?",
+            (channel_id,),
+        ).fetchall()
+    else:
+        rows = req.conn.execute(
+            "SELECT u.* FROM guild_members m JOIN users u ON u.id = m.user_id"
+            " WHERE m.guild_id = ? ORDER BY u.username COLLATE NOCASE",
+            (ch["guild_id"],),
+        ).fetchall()
+    return {
+        "users": [db.public_user(r, db.is_online(r)) for r in rows],
+        "everyone": ch["kind"] != "dm",
+    }
 
 
 @route("GET", r"/api/channels/(\d+)")

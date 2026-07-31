@@ -129,6 +129,16 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 
+-- Who a message pings. Written when the message is sent, so unread-mention
+-- counts stay cheap and survive the author editing the text later.
+CREATE TABLE IF NOT EXISTS mentions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE (message_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mentions_user ON mentions(user_id, message_id);
+
 CREATE TABLE IF NOT EXISTS reactions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -214,6 +224,12 @@ def migrate(conn):
         conn.execute(
             "ALTER TABLE messages ADD COLUMN sticker_id INTEGER"
             " REFERENCES stickers(id) ON DELETE SET NULL"
+        )
+    if "reply_to" not in have:
+        # Null once the replied-to message is deleted; the reply survives.
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN reply_to INTEGER"
+            " REFERENCES messages(id) ON DELETE SET NULL"
         )
 
 

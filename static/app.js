@@ -13,6 +13,8 @@ const state = {
   activeChannelId: null,
   activeChannel: null,      // channel info object
   messages: [],
+  replyTo: null,            // message being replied to, if any
+  mentionable: [],          // members of the open channel, for @ autocomplete
   rev: '',
   channelRev: '',           // fingerprint of the open channel (edits/reactions)
   homeTab: 'friends',       // 'friends' when no DM is open
@@ -67,14 +69,30 @@ function unescapeHtml(str) {
   ));
 }
 
+// Mentions are stored as the full tag so they survive a rename ambiguity;
+// they're displayed as a plain @name pill.
+const MENTION_RE = /@([A-Za-z0-9_.\- ]{2,32})#(\d{4})/g;
+
 function formatContent(raw) {
   let html = escapeHtml(raw);
   html = html.replace(/`([^`\n]+)`/g, (_, code) => `<code>${code}</code>`);
+  html = html.replace(MENTION_RE, (full, name, disc) => {
+    const tag = `${name}#${disc}`;
+    const isMe = state.me && tag === state.me.tag;
+    return `<span class="mention${isMe ? ' me' : ''}" title="${escapeHtml(tag)}">`
+      + `@${name}</span>`;
+  });
+  html = html.replace(/@everyone\b/g, '<span class="mention everyone">@everyone</span>');
   html = html.replace(/https?:\/\/[^\s<]+[^\s<.,:;"')\]]/g, (url) => {
     const href = unescapeHtml(url);
     return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${url}</a>`;
   });
   return html;
+}
+
+/** Plain-text version for reply previews: strip the #0000 off mentions. */
+function previewText(raw) {
+  return (raw || '').replace(MENTION_RE, (_, name) => `@${name}`);
 }
 
 function initials(name) {
@@ -238,7 +256,13 @@ function renderRail() {
     btn.textContent = g.name.split(/\s+/).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
     btn.classList.toggle('active', state.activeGuildId === g.id);
     const unread = g.channels.reduce((n, c) => n + c.unread, 0);
-    if (unread > 0) {
+    const pings = g.channels.reduce((n, c) => n + (c.mentions || 0), 0);
+    if (pings > 0) {
+      const b = el('span', 'rail-badge ping', pings > 99 ? '99+' : `@${pings}`);
+      b.title = `${pings} message${pings === 1 ? '' : 's'} mentioning you`;
+      btn.appendChild(b);
+      if (state.activeGuildId !== g.id) btn.classList.add('pinged');
+    } else if (unread > 0) {
       btn.appendChild(el('span', 'rail-badge', unread > 99 ? '99+' : String(unread)));
       if (state.activeGuildId !== g.id) btn.classList.add('pinged');
     }
@@ -278,7 +302,11 @@ function renderSidebar() {
       if (c.unread > 0) item.classList.add('unread');
       item.appendChild(el('span', 'hash', '#'));
       item.appendChild(el('span', 'label', c.name));
-      if (c.unread > 0 && c.id !== state.activeChannelId) {
+      if (c.mentions > 0 && c.id !== state.activeChannelId) {
+        const ping = el('span', 'badge ping', c.mentions > 99 ? '99+' : `@${c.mentions}`);
+        ping.title = `${c.mentions} message${c.mentions === 1 ? '' : 's'} mentioning you`;
+        item.appendChild(ping);
+      } else if (c.unread > 0 && c.id !== state.activeChannelId) {
         item.appendChild(el('span', 'badge', c.unread > 99 ? '99+' : String(c.unread)));
       }
       item.onclick = () => openChannel(c.id);
@@ -407,8 +435,13 @@ function renderMessages() {
 }
 
 function messageNode(m, grouped) {
+  // A reply always shows its own header, so it never merges with the message above.
+  if (m.replyToId) grouped = false;
   const node = el('div', `msg ${grouped ? 'grouped' : ''}`.trim());
   node.dataset.id = m.id;
+  if (m.mentionsMe) node.classList.add('pinged');
+
+  if (m.replyToId) node.appendChild(replyPreview(m));
 
   const gutter = el('div', 'msg-gutter');
   if (grouped) {
@@ -452,6 +485,10 @@ function messageNode(m, grouped) {
     react.title = 'Add reaction';
     react.onclick = (e) => openEmojiPicker(e.currentTarget, (emoji) => react_(m.id, emoji));
     actions.appendChild(react);
+    const reply = el('button', null, '↩');
+    reply.title = 'Reply';
+    reply.onclick = () => startReply(m);
+    actions.appendChild(reply);
     if (mine && m.content && !m.sticker) {
       const edit = el('button', null, '✎');
       edit.title = 'Edit';
@@ -473,6 +510,59 @@ function messageNode(m, grouped) {
   }
   return node;
 }
+
+// ------------------------------------------------------------------ replies
+
+function replyPreview(m) {
+  const bar = el('div', 'reply-preview');
+  bar.appendChild(el('span', 'reply-spine'));
+
+  if (!m.replyTo) {
+    bar.appendChild(el('span', 'reply-gone', 'Original message was deleted'));
+    return bar;
+  }
+
+  const who = el('span', 'reply-author', m.replyTo.author.username);
+  who.style.color = m.replyTo.author.color;
+  who.onclick = () => showProfile(m.replyTo.author.id);
+
+  bar.appendChild(avatar(m.replyTo.author, 'xs'));
+  bar.appendChild(who);
+  bar.appendChild(el('span', 'reply-text', previewText(m.replyTo.content) || 'Click to see'));
+  bar.onclick = (e) => {
+    if (e.target === who) return;
+    jumpToMessage(m.replyTo.id);
+  };
+  return bar;
+}
+
+function jumpToMessage(id) {
+  const target = $(`#messages .msg[data-id="${id}"]`);
+  if (!target) {
+    toast('That message is further up than the last 50 — scroll up to find it.');
+    return;
+  }
+  target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  target.classList.remove('flash');
+  void target.offsetWidth;            // restart the animation if it's re-clicked
+  target.classList.add('flash');
+  setTimeout(() => target.classList.remove('flash'), 1600);
+}
+
+function startReply(m) {
+  state.replyTo = m;
+  const label = m.author.username;
+  $('#reply-bar-name').textContent = label;
+  $('#reply-bar').hidden = false;
+  input.focus();
+}
+
+function cancelReply() {
+  state.replyTo = null;
+  $('#reply-bar').hidden = true;
+}
+
+$('#reply-cancel').onclick = cancelReply;
 
 // ------------------------------------------------------- attachments & stickers
 
@@ -825,7 +915,10 @@ async function openChannel(channelId) {
   state.activeChannelId = channelId;
   state.channelRev = '';
   closePopover();
+  closeMentions();
+  cancelReply();
   stopPoll();
+  loadMentionable(channelId);
   $('#composer').classList.remove('hidden-composer');
   // Clear any inline height and let CSS supply the resting size. Measuring
   // here would be wrong anyway: during boot the chat pane has no height yet
@@ -899,6 +992,31 @@ function autosize() {
 input.addEventListener('input', autosize);
 
 input.addEventListener('keydown', (e) => {
+  // While the @ list is open it owns the arrows, Tab, Enter and Escape.
+  if (mentionBox && mentionMatches.length) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const step = e.key === 'ArrowDown' ? 1 : -1;
+      mentionIndex = (mentionIndex + step + mentionMatches.length) % mentionMatches.length;
+      paintMentionSelection();
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      applyMention(mentionMatches[mentionIndex]);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeMentions();
+      return;
+    }
+  }
+  if (e.key === 'Escape' && state.replyTo) {
+    e.preventDefault();
+    cancelReply();
+    return;
+  }
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendMessage();
@@ -909,11 +1027,13 @@ $('#send-btn').onclick = sendMessage;
 async function sendMessage() {
   const content = input.value.trim();
   if (!content || !state.activeChannelId) return;
+  const replyTo = state.replyTo ? state.replyTo.id : null;
   input.value = '';
   autosize();
+  cancelReply();
   try {
     const data = await api('POST', `/api/channels/${state.activeChannelId}/messages`,
-      { content });
+      { content, replyTo });
     if (!state.messages.some((m) => m.id === data.message.id)) {
       state.messages.push(data.message);
       state.atBottom = true;
@@ -1025,6 +1145,121 @@ input.addEventListener('paste', (e) => {
     uploadFiles([...e.dataTransfer.files]);
   });
 })();
+
+// --------------------------------------------------------- @ mention autocomplete
+
+let mentionBox = null;
+let mentionMatches = [];
+let mentionIndex = 0;
+let mentionStart = -1;
+
+function closeMentions() {
+  if (mentionBox) { mentionBox.remove(); mentionBox = null; }
+  mentionMatches = [];
+  mentionStart = -1;
+}
+
+/** The "@word" being typed immediately before the caret, or null. */
+function activeMentionQuery() {
+  const caret = input.selectionStart ?? 0;
+  const before = input.value.slice(0, caret);
+  // Allow spaces inside the query so multi-word usernames can be found, but
+  // stop at a newline or a preceding non-boundary character.
+  const at = before.lastIndexOf('@');
+  if (at === -1) return null;
+  if (at > 0 && !/[\s(]/.test(before[at - 1])) return null;
+  const query = before.slice(at + 1);
+  if (/[\n`]/.test(query) || query.length > 32) return null;
+  // A '#' can only come from a finished tag — usernames never contain one —
+  // so this mention is already complete and needs no suggestions.
+  if (/#\d{0,4}/.test(query)) return null;
+  return { at, query };
+}
+
+function renderMentionBox() {
+  const found = activeMentionQuery();
+  if (!found || !state.activeChannelId) return closeMentions();
+
+  const q = found.query.toLowerCase().trim();
+  const people = state.mentionable
+    .filter((u) => !state.me || u.id !== state.me.id)
+    .filter((u) => u.username.toLowerCase().includes(q) || u.tag.toLowerCase().includes(q));
+
+  const options = [];
+  if (state.mentionEveryone && 'everyone'.startsWith(q)) {
+    options.push({ everyone: true, username: 'everyone',
+                   note: 'Notify everyone in this server' });
+  }
+  options.push(...people.slice(0, 8));
+
+  if (!options.length) return closeMentions();
+
+  mentionMatches = options;
+  mentionStart = found.at;
+  mentionIndex = Math.min(mentionIndex, options.length - 1);
+
+  if (!mentionBox) {
+    mentionBox = el('div', 'popover mention-pop');
+    document.body.appendChild(mentionBox);
+  }
+  mentionBox.replaceChildren();
+  mentionBox.appendChild(el('div', 'pop-title', 'Members'));
+
+  options.forEach((u, i) => {
+    const row = el('button', `mention-row ${i === mentionIndex ? 'active' : ''}`.trim());
+    if (u.everyone) {
+      row.appendChild(el('span', 'mention-everyone', '@'));
+      row.appendChild(el('span', 'mention-name', 'everyone'));
+      row.appendChild(el('span', 'mention-tag', u.note));
+    } else {
+      row.appendChild(avatar(u, 'xs'));
+      row.appendChild(el('span', 'mention-name', u.username));
+      row.appendChild(el('span', 'mention-tag', `#${u.discriminator}`));
+    }
+    row.onmouseenter = () => { mentionIndex = i; paintMentionSelection(); };
+    row.onclick = () => applyMention(u);
+    mentionBox.appendChild(row);
+  });
+
+  // Anchor above the composer, aligned to its left edge.
+  const box = $('#composer-box').getBoundingClientRect();
+  mentionBox.style.left = `${box.left}px`;
+  const rect = mentionBox.getBoundingClientRect();
+  mentionBox.style.top = `${Math.max(12, box.top - rect.height - 8)}px`;
+  mentionBox.style.width = `${Math.min(360, box.width)}px`;
+}
+
+function paintMentionSelection() {
+  if (!mentionBox) return;
+  [...mentionBox.querySelectorAll('.mention-row')].forEach((r, i) =>
+    r.classList.toggle('active', i === mentionIndex));
+}
+
+function applyMention(u) {
+  if (mentionStart < 0) return;
+  const caret = input.selectionStart ?? input.value.length;
+  const token = u.everyone ? '@everyone ' : `@${u.username}#${u.discriminator} `;
+  input.value = input.value.slice(0, mentionStart) + token + input.value.slice(caret);
+  const pos = mentionStart + token.length;
+  input.focus();
+  input.setSelectionRange(pos, pos);
+  closeMentions();
+  autosize();
+}
+
+input.addEventListener('input', renderMentionBox);
+input.addEventListener('blur', () => setTimeout(closeMentions, 120));
+
+async function loadMentionable(channelId) {
+  state.mentionable = [];
+  state.mentionEveryone = false;
+  try {
+    const data = await api('GET', `/api/channels/${channelId}/mentionable`);
+    if (state.activeChannelId !== channelId) return;
+    state.mentionable = data.users;
+    state.mentionEveryone = data.everyone;
+  } catch { /* autocomplete is a convenience, not required */ }
+}
 
 // ----------------------------------------------------------- emoji & stickers
 
