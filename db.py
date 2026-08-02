@@ -283,6 +283,9 @@ def migrate(conn):
         conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
     if "is_bot" not in have:
         conn.execute("ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
+    if "status" not in have:
+        # Short free-text line shown under the name, like a Discord status.
+        conn.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT ''")
 
     have = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
     if "game_id" not in have:
@@ -376,6 +379,7 @@ def public_user(row, online=False):
         "bio": row["bio"] if "bio" in row.keys() else "",
         "avatarUrl": avatar_url(row),
         "isBot": bool(row["is_bot"]) if "is_bot" in row.keys() else False,
+        "status": row["status"] if "status" in row.keys() else "",
         "online": online,
     }
 

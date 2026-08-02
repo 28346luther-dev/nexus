@@ -547,6 +547,7 @@ def me_payload(row):
         "email": row["email"],
         "color": row["color"],
         "bio": row["bio"],
+        "status": row["status"],
         "avatarUrl": db.avatar_url(row),
     }
 
@@ -566,6 +567,10 @@ def api_update_me(req):
     if "bio" in req.body:
         fields.append("bio = ?")
         values.append(str(req.body["bio"])[:190])
+    if "status" in req.body:
+        # One short line — anything longer would wreck the member list layout.
+        fields.append("status = ?")
+        values.append(" ".join(str(req.body["status"]).split())[:60])
     if "color" in req.body:
         color = str(req.body["color"])
         if not re.match(r"^#[0-9a-fA-F]{6}$", color):
@@ -1244,9 +1249,62 @@ def api_delete_message(req, message_id):
         allowed = g and g["owner_id"] == req.user["id"]
     if not allowed:
         raise HttpError(403, "You can't delete that message.")
-    with req.conn:
-        req.conn.execute("DELETE FROM messages WHERE id = ?", (msg["id"],))
+    drop_messages(req.conn, [msg["id"]])
     return {"ok": True}
+
+
+MAX_PURGE = 100
+
+
+def drop_messages(conn, ids):
+    """Delete messages and the image files that only they referenced.
+
+    Attachment rows cascade away with the message, but the files on disk would
+    otherwise sit there forever.
+    """
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    files = [
+        r["stored_name"]
+        for r in conn.execute(
+            f"SELECT stored_name FROM attachments WHERE message_id IN ({marks})", ids
+        )
+    ]
+    with conn:
+        conn.execute(f"DELETE FROM messages WHERE id IN ({marks})", ids)
+    for name in files:
+        discard_upload(name)
+    return len(ids)
+
+
+@route("POST", r"/api/channels/(\d+)/purge")
+def api_purge(req, channel_id):
+    """Bulk-delete the most recent messages in a channel."""
+    req.require_auth()
+    channel_id = int(channel_id)
+    ch = channel_access_or_403(req, channel_id)
+    if ch["kind"] != "text":
+        raise HttpError(400, "Purge only works in server channels.")
+    owner_only(req, ch["guild_id"])
+
+    try:
+        count = int(req.body.get("count") or 0)
+    except (TypeError, ValueError):
+        raise HttpError(400, "Give a number of messages to delete.")
+    if count < 1:
+        raise HttpError(400, "Give a number of messages to delete.")
+    if count > MAX_PURGE:
+        raise HttpError(400, f"You can purge at most {MAX_PURGE} messages at a time.")
+
+    ids = [
+        r["id"]
+        for r in req.conn.execute(
+            "SELECT id FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?",
+            (channel_id, count),
+        )
+    ]
+    return {"deleted": drop_messages(req.conn, ids)}
 
 
 @route("PATCH", r"/api/messages/(\d+)")

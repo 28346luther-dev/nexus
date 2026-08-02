@@ -395,13 +395,23 @@ async function renderMembers() {
   state.members.forEach((m) => {
     const row = el('button', `member ${m.online ? '' : 'offline'}`.trim());
     row.appendChild(avatar(m));
-    row.appendChild(el('span', 'm-name', m.username));
-    if (m.isBot) row.appendChild(el('span', 'bot-tag', 'BOT'));
+    // Name and status stack, so a status never widens the row.
+    const text = el('div', 'm-text');
+    const line = el('div', 'm-line');
+    line.appendChild(el('span', 'm-name', m.username));
+    if (m.isBot) line.appendChild(el('span', 'bot-tag', 'BOT'));
     if (m.isOwner) {
       const crown = el('span', 'crown', '♛');
       crown.title = 'Server owner';
-      row.appendChild(crown);
+      line.appendChild(crown);
     }
+    text.appendChild(line);
+    if (m.status) {
+      const st = el('div', 'm-status', m.status);
+      st.title = m.status;
+      text.appendChild(st);
+    }
+    row.appendChild(text);
     row.onclick = () => (m.isBot ? showBotPanel() : showProfile(m.id));
     list.appendChild(row);
   });
@@ -1138,9 +1148,12 @@ input.addEventListener('keydown', (e) => {
       return;
     }
     if (e.key === 'Enter' && !e.shiftKey) {
-      // Run the highlighted command rather than posting a half-typed one.
       e.preventDefault();
-      runCommand(commandMatches[commandIndex]);
+      // If they've already typed a full command with its argument, honour
+      // that — otherwise run whatever is highlighted in the list.
+      const typed = matchCommand(input.value);
+      if (typed && !typed.unknown && typed.arg != null) runCommand(typed.cmd, typed.arg);
+      else runCommand(commandMatches[commandIndex]);
       return;
     }
     if (e.key === 'Escape') {
@@ -1186,13 +1199,17 @@ async function sendMessage() {
   if (!content || !state.activeChannelId) return;
 
   // A leading slash runs a command rather than posting text.
-  const cmd = matchCommand(content);
-  if (cmd) {
-    if (cmd.unknown) {
-      toast(`${cmd.unknown} isn't a command. Try /blackjack.`, 'error');
+  const hit = matchCommand(content);
+  if (hit) {
+    if (hit.unknown) {
+      toast(`${hit.unknown} isn't a command. Try /blackjack.`, 'error');
       return;
     }
-    runCommand(cmd);
+    if (!commandAvailable(hit.cmd)) {
+      toast(`Only the server owner can use ${hit.cmd.name}.`, 'error');
+      return;
+    }
+    runCommand(hit.cmd, hit.arg);
     return;
   }
 
@@ -1315,6 +1332,46 @@ input.addEventListener('paste', (e) => {
   });
 })();
 
+// ------------------------------------------------------------- ping sound
+
+// Synthesised rather than shipped as a file: two short notes, no assets, no
+// network request, and it can't be blocked by an ad blocker.
+let audioCtx = null;
+
+function pingSoundEnabled() {
+  return localStorage.getItem('nexus.ping') !== 'off';
+}
+
+function setPingSound(on) {
+  localStorage.setItem('nexus.ping', on ? 'on' : 'off');
+}
+
+function playPing() {
+  if (!pingSoundEnabled()) return;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!audioCtx) audioCtx = new Ctx();
+    // Browsers suspend audio until the page has been interacted with.
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+
+    const now = audioCtx.currentTime;
+    [[880, 0], [1174.66, 0.11]].forEach(([freq, offset]) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      // Quick fade in and out so it chimes instead of clicking.
+      gain.gain.setValueAtTime(0, now + offset);
+      gain.gain.linearRampToValueAtTime(0.16, now + offset + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.22);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(now + offset);
+      osc.stop(now + offset + 0.24);
+    });
+  } catch { /* audio is a nicety; never break the app over it */ }
+}
+
 // ------------------------------------------------------------ slash commands
 
 const COMMANDS = [
@@ -1330,7 +1387,51 @@ const COMMANDS = [
     summary: 'Open a 1v1 anyone in the server can join',
     run: () => startGame('pvp'),
   },
+  {
+    name: '/purge',
+    args: '<number>',
+    summary: 'Delete the last N messages — server owner only',
+    takesNumber: true,
+    ownerOnly: true,
+    run: (n) => confirmPurge(n),
+  },
 ];
+
+/** Owner-only commands are hidden from everyone else's command list. */
+function commandAvailable(c) {
+  if (!c.ownerOnly) return true;
+  const guild = state.guilds.find((g) => g.id === state.activeGuildId);
+  return !!(guild && guild.isOwner);
+}
+
+function availableCommands() {
+  return COMMANDS.filter(commandAvailable);
+}
+
+function confirmPurge(count) {
+  if (!count || count < 1) {
+    toast('Say how many to delete, e.g. /purge 10', 'error');
+    return;
+  }
+  const channel = state.activeChannel;
+  if (!channel || channel.kind !== 'text') {
+    toast('Purge only works in a server channel.', 'error');
+    return;
+  }
+  // Destructive and irreversible, so never fire straight off the keystroke.
+  confirmModal(
+    `Delete the last ${count} message${count === 1 ? '' : 's'}?`,
+    `The most recent ${count} message${count === 1 ? '' : 's'} in #${channel.name} `
+    + 'will be permanently removed for everyone, along with any images in them. '
+    + 'This cannot be undone.',
+    `Delete ${count}`,
+    async () => {
+      const data = await api('POST', `/api/channels/${state.activeChannelId}/purge`,
+        { count });
+      await reloadChannelMessages();
+      toast(`Deleted ${data.deleted} message${data.deleted === 1 ? '' : 's'}.`, 'ok');
+    });
+}
 
 async function startGame(mode) {
   if (!state.activeChannelId) return;
@@ -1345,12 +1446,22 @@ async function startGame(mode) {
 function matchCommand(text) {
   const trimmed = text.trim();
   if (!trimmed.startsWith('/')) return null;
-  const lower = trimmed.toLowerCase();
-  const exact = COMMANDS.find((c) => `${c.name} ${c.args}` === lower);
-  if (exact) return exact;
+  const [verbRaw, ...rest] = trimmed.split(/\s+/);
+  const verb = verbRaw.toLowerCase();
+  const tail = rest.join(' ').toLowerCase();
+
+  const numeric = COMMANDS.find((c) => c.name === verb && c.takesNumber);
+  if (numeric) {
+    const n = parseInt(tail, 10);
+    return { cmd: numeric, arg: Number.isNaN(n) ? null : n };
+  }
+
+  const exact = COMMANDS.find((c) => c.name === verb && c.args === tail);
+  if (exact) return { cmd: exact };
   // "/blackjack" on its own runs the first variant.
-  const bare = COMMANDS.find((c) => c.name === lower);
-  return bare || { unknown: trimmed.split(/\s+/)[0] };
+  const bare = COMMANDS.find((c) => c.name === verb);
+  if (bare && !tail) return { cmd: bare };
+  return { unknown: verbRaw };
 }
 
 let commandBox = null;
@@ -1368,8 +1479,12 @@ function renderCommandBox() {
   if (!text.startsWith('/') || text.includes('\n')) return closeCommands();
 
   const q = text.toLowerCase();
-  const matches = COMMANDS.filter((c) => `${c.name} ${c.args}`.startsWith(q)
-    || c.name.startsWith(q));
+  const verb = q.split(/\s+/)[0];
+  const usable = availableCommands();
+  // Prefer a full "name args" match; fall back to the verb so "/purge 10"
+  // keeps showing the /purge hint while the number is being typed.
+  let matches = usable.filter((c) => `${c.name} ${c.args}`.startsWith(q));
+  if (!matches.length) matches = usable.filter((c) => c.name.startsWith(verb));
   if (!matches.length) return closeCommands();
 
   commandMatches = matches;
@@ -1386,7 +1501,11 @@ function renderCommandBox() {
     row.appendChild(el('span', 'cmd-name', `${c.name} ${c.args}`));
     row.appendChild(el('span', 'mention-tag', c.summary));
     row.onmouseenter = () => { commandIndex = i; paintCommandSelection(); };
-    row.onclick = () => runCommand(c);
+    row.onclick = () => {
+      const typed = matchCommand(input.value);
+      if (typed && typed.cmd === c && typed.arg != null) runCommand(c, typed.arg);
+      else runCommand(c);
+    };
     commandBox.appendChild(row);
   });
 
@@ -1403,11 +1522,21 @@ function paintCommandSelection() {
     r.classList.toggle('active', i === commandIndex));
 }
 
-function runCommand(cmd) {
+function runCommand(cmd, arg) {
+  // A command that needs a number and hasn't got one yet: prefill the box and
+  // let them finish typing rather than firing with nothing.
+  if (cmd.takesNumber && (arg === null || arg === undefined)) {
+    input.value = `${cmd.name} `;
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    autosize();
+    renderCommandBox();
+    return;
+  }
   input.value = '';
   autosize();
   closeCommands();
-  cmd.run();
+  cmd.run(arg);
 }
 
 input.addEventListener('input', renderCommandBox);
@@ -1636,6 +1765,8 @@ async function startPoll() {
         const known = new Set(state.messages.map((m) => m.id));
         const fresh = data.messages.filter((m) => !known.has(m.id));
         if (fresh.length) {
+          // Chime once per batch, not once per message.
+          if (fresh.some((m) => m.mentionsMe && m.author.id !== state.me.id)) playPing();
           state.messages.push(...fresh);
           renderMessages();
           if (state.atBottom) scrollToBottom();
@@ -1654,7 +1785,11 @@ async function startPoll() {
       const changed = data.rev !== state.rev;
       state.rev = data.rev;
       if (changed) {
+        // A mention in a channel you're not looking at never reaches the
+        // message stream, so watch the unread-ping totals instead.
+        const pingsBefore = totalMentions();
         await refreshSidebarData();
+        if (totalMentions() > pingsBefore) playPing();
         renderRail();
         renderSidebar();
         if (!state.activeChannelId) renderFriendsView();
@@ -1703,6 +1838,14 @@ async function stillSignedIn() {
 }
 
 // ------------------------------------------------------------------ data
+
+/** Unread pings across every server channel and DM. */
+function totalMentions() {
+  const inGuilds = state.guilds.reduce(
+    (n, g) => n + g.channels.reduce((c, ch) => c + (ch.mentions || 0), 0), 0);
+  const inDms = state.dms.reduce((n, d) => n + (d.mentions || 0), 0);
+  return inGuilds + inDms;
+}
 
 async function refreshSidebarData() {
   const [guilds, dms, friends] = await Promise.all([
@@ -2228,7 +2371,7 @@ function showBotPanel() {
 
     const stack = el('div');
     stack.style.cssText = 'display:flex;flex-direction:column;gap:8px';
-    COMMANDS.forEach((c) => {
+    availableCommands().forEach((c) => {
       const b = el('button', 'btn');
       b.appendChild(el('strong', null, `${c.name} ${c.args}`));
       b.appendChild(el('span', 'muted', ` — ${c.summary}`));
@@ -2257,6 +2400,7 @@ async function showProfile(userId) {
     const meta = el('div');
     meta.appendChild(el('h2', null, user.username));
     meta.appendChild(el('p', 'muted', user.tag));
+    if (user.status) meta.appendChild(el('p', 'profile-status', user.status));
     meta.appendChild(el('p', 'muted', user.online ? 'Online now' : 'Offline'));
     head.appendChild(meta);
     box.appendChild(head);
@@ -2428,6 +2572,17 @@ $('#me-settings').onclick = () => {
       `Changing your username assigns a new tag. Yours is currently ${state.me.tag}.`));
     form.appendChild(nameLabel);
 
+    const statusLabel = el('label', 'field');
+    statusLabel.appendChild(el('span', null, 'Status'));
+    const statusInput = el('input');
+    statusInput.value = state.me.status || '';
+    statusInput.maxLength = 60;
+    statusInput.placeholder = 'Working on the site';
+    statusLabel.appendChild(statusInput);
+    statusLabel.appendChild(el('small', null,
+      'One short line, shown under your name in the member list.'));
+    form.appendChild(statusLabel);
+
     const bioLabel = el('label', 'field');
     bioLabel.appendChild(el('span', null, 'About me'));
     const bioInput = el('textarea');
@@ -2436,6 +2591,22 @@ $('#me-settings').onclick = () => {
     bioInput.value = state.me.bio || '';
     bioLabel.appendChild(bioInput);
     form.appendChild(bioLabel);
+
+    const soundLabel = el('label', 'field toggle-field');
+    const soundBox = el('input');
+    soundBox.type = 'checkbox';
+    soundBox.checked = pingSoundEnabled();
+    soundBox.onchange = () => {
+      setPingSound(soundBox.checked);
+      if (soundBox.checked) playPing();          // let them hear it
+    };
+    soundLabel.appendChild(soundBox);
+    const soundText = el('div');
+    soundText.appendChild(el('strong', null, 'Play a sound when I\'m mentioned'));
+    soundText.appendChild(el('small', null,
+      'Chimes for @mentions and @everyone, in any channel.'));
+    soundLabel.appendChild(soundText);
+    form.appendChild(soundLabel);
 
     const colorLabel = el('label', 'field');
     colorLabel.appendChild(el('span', null, 'Avatar colour'));
@@ -2460,6 +2631,7 @@ $('#me-settings').onclick = () => {
       try {
         const data = await api('PATCH', '/api/me', {
           username: nameInput.value.trim(),
+          status: statusInput.value,
           bio: bioInput.value,
           color: colorInput.value,
         });
@@ -2489,7 +2661,10 @@ function renderMe() {
   fresh.id = 'me-avatar';
   $('#me-avatar').replaceWith(fresh);
   $('#me-name').textContent = state.me.username;
-  $('#me-tag').textContent = `#${state.me.discriminator}`;
+  // The status replaces the tag when set — there's only room for one line.
+  const sub = $('#me-tag');
+  sub.textContent = state.me.status || `#${state.me.discriminator}`;
+  sub.title = state.me.status ? `${state.me.status} · ${state.me.tag}` : state.me.tag;
 }
 
 // ------------------------------------------------------------------ boot
