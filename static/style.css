@@ -553,6 +553,63 @@ button { background:none; border:0; cursor:pointer; }
   font-size:11.5px; color:var(--text-mute);
 }
 
+/* ------------------------------------------------------ slots & currency */
+.game-stake {
+  font-size:12px; font-weight:700; color:#f8c57a; background:rgba(250,166,26,.16);
+  border-radius:10px; padding:1px 8px;
+}
+.game-card.slots { border-left-color:var(--yellow); }
+.game-card.slots.won { border-left-color:var(--green); }
+
+.reels {
+  display:flex; gap:8px; justify-content:center; margin:6px 0 12px;
+  background:var(--bg-0); border-radius:8px; padding:14px 10px;
+}
+.reel {
+  width:66px; height:78px; background:#f6f6f4; border-radius:6px;
+  display:grid; place-items:center; font-size:34px; line-height:1;
+  box-shadow:0 1px 3px rgba(0,0,0,.45);
+}
+
+.stake-quick { display:flex; gap:6px; flex-wrap:wrap; margin:-6px 0 4px; }
+
+.stat-grid {
+  display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin:4px 0 12px;
+}
+.stat {
+  background:var(--bg-0); border-radius:8px; padding:9px 10px;
+  display:flex; flex-direction:column; gap:2px;
+}
+.stat-label {
+  font-size:10.5px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
+  color:var(--text-mute);
+}
+.stat-value { font-size:17px; font-weight:650; }
+
+.rank-list { display:flex; flex-direction:column; gap:2px; margin-top:6px; }
+.rank-row {
+  display:flex; align-items:center; gap:10px; padding:8px 6px;
+  border-radius:6px; border-top:1px solid var(--line);
+}
+.rank-row:hover { background:var(--bg-3); }
+.rank-pos {
+  width:22px; flex:none; text-align:center; font-size:13px; font-weight:700;
+  color:var(--text-mute);
+}
+.rank-pos.podium { color:var(--yellow); }
+.rank-who { flex:1; min-width:0; }
+.rank-who strong {
+  display:block; font-size:14.5px; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.rank-who small {
+  display:block; font-size:11.5px; color:var(--text-mute);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.rank-score { font-size:13.5px; font-weight:650; flex:none; }
+.rank-score.up { color:#8ce0a8; }
+.rank-score.down { color:#ffa9ab; }
+
 .command-pop { padding:6px; }
 .cmd-name {
   font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13.5px;
@@ -615,7 +672,9 @@ button { background:none; border:0; cursor:pointer; }
 .msg.pinged { background:rgba(250,166,26,.07); box-shadow:inset 2px 0 0 var(--yellow); }
 .msg.pinged:hover { background:rgba(250,166,26,.11); }
 
-.badge.ping, .rail-badge.ping { background:var(--yellow); color:#1a1b20; }
+/* Plain unread reads as white; a mention is the one that shouts in red. */
+.side-item .badge, .rail-badge { background:#f2f3f5; color:#1a1b20; }
+.badge.ping, .rail-badge.ping { background:var(--red); color:#fff; }
 
 .mention-pop { padding:6px; max-height:280px; overflow-y:auto; }
 .mention-row {

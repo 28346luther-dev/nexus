@@ -183,6 +183,19 @@ CREATE TABLE IF NOT EXISTS stickers (
     archived    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_stickers_guild ON stickers(guild_id);
+
+-- Running totals per player for the Gamesman leaderboard.
+CREATE TABLE IF NOT EXISTS game_stats (
+    user_id     INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    wins        INTEGER NOT NULL DEFAULT 0,
+    losses      INTEGER NOT NULL DEFAULT 0,
+    pushes      INTEGER NOT NULL DEFAULT 0,
+    wagered     INTEGER NOT NULL DEFAULT 0,
+    net         INTEGER NOT NULL DEFAULT 0,
+    biggest_win INTEGER NOT NULL DEFAULT 0,
+    streak      INTEGER NOT NULL DEFAULT 0,
+    best_streak INTEGER NOT NULL DEFAULT 0
+);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_stickers_name
     ON stickers(guild_id, name) WHERE archived = 0;
 """
@@ -225,6 +238,86 @@ def init():
             (now() - SESSION_IDLE_TTL,),
         )
     conn.close()
+
+
+# ---------------------------------------------------------------- Sana Coin
+
+STARTING_COINS = 2000
+DAILY_CLAIM = 1000
+CLAIM_INTERVAL = 60 * 60 * 24
+
+# Rank is earned by wins, not by balance, so it can't simply be bought.
+RANKS = [
+    (0, "Rookie"),
+    (5, "Chancer"),
+    (15, "Hustler"),
+    (40, "Sharp"),
+    (80, "High Roller"),
+    (150, "Sana Legend"),
+]
+
+
+def rank_for(wins):
+    name = RANKS[0][1]
+    for threshold, label in RANKS:
+        if wins >= threshold:
+            name = label
+    return name
+
+
+def next_rank(wins):
+    """(label, wins still needed) for the next tier, or None at the top."""
+    for threshold, label in RANKS:
+        if wins < threshold:
+            return {"name": label, "winsAway": threshold - wins}
+    return None
+
+
+def balance(conn, user_id):
+    row = conn.execute("SELECT coins FROM users WHERE id = ?", (user_id,)).fetchone()
+    return row["coins"] if row else 0
+
+
+def adjust_coins(conn, user_id, delta):
+    """Move a player's balance, never below zero."""
+    conn.execute(
+        "UPDATE users SET coins = MAX(0, coins + ?) WHERE id = ?", (delta, user_id)
+    )
+
+
+def stats_for(conn, user_id):
+    conn.execute("INSERT OR IGNORE INTO game_stats (user_id) VALUES (?)", (user_id,))
+    return conn.execute(
+        "SELECT * FROM game_stats WHERE user_id = ?", (user_id,)
+    ).fetchone()
+
+
+def record_result(conn, user_id, outcome, profit, wagered):
+    """Fold one finished hand into a player's running totals.
+
+    `profit` is the net change: positive when they came out ahead.
+    """
+    stats_for(conn, user_id)
+    if outcome == "win":
+        conn.execute(
+            "UPDATE game_stats SET wins = wins + 1, streak = streak + 1,"
+            " best_streak = MAX(best_streak, streak + 1),"
+            " biggest_win = MAX(biggest_win, ?) WHERE user_id = ?",
+            (profit, user_id),
+        )
+    elif outcome == "lose":
+        conn.execute(
+            "UPDATE game_stats SET losses = losses + 1, streak = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE game_stats SET pushes = pushes + 1 WHERE user_id = ?", (user_id,)
+        )
+    conn.execute(
+        "UPDATE game_stats SET wagered = wagered + ?, net = net + ? WHERE user_id = ?",
+        (wagered, profit, user_id),
+    )
 
 
 BOT_NAME = "Gamesman"
@@ -286,6 +379,18 @@ def migrate(conn):
     if "status" not in have:
         # Short free-text line shown under the name, like a Discord status.
         conn.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT ''")
+    if "coins" not in have:
+        # Sana Coin. Everyone starts with a stake so a new account can play.
+        conn.execute(
+            f"ALTER TABLE users ADD COLUMN coins INTEGER NOT NULL DEFAULT {STARTING_COINS}"
+        )
+        conn.execute("ALTER TABLE users ADD COLUMN last_claim INTEGER NOT NULL DEFAULT 0")
+
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(games)")}
+    if "bet" not in have:
+        conn.execute("ALTER TABLE games ADD COLUMN bet INTEGER NOT NULL DEFAULT 0")
+        # Set once winnings are paid, so a replayed row can't pay out twice.
+        conn.execute("ALTER TABLE games ADD COLUMN settled INTEGER NOT NULL DEFAULT 0")
 
     have = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
     if "game_id" not in have:

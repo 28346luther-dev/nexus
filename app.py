@@ -24,6 +24,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 import blackjack
 import db
 import images
+import slots
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -1586,12 +1587,143 @@ def api_open_dm(req):
     return {"channelId": cid}
 
 
+# ------------------------------------------------------------ Sana Coin API
+
+def wallet_payload(conn, user_id):
+    row = conn.execute("SELECT coins, last_claim FROM users WHERE id = ?", (user_id,)).fetchone()
+    st = db.stats_for(conn, user_id)
+    waited = db.now() - row["last_claim"]
+    return {
+        "coins": row["coins"],
+        "canClaim": waited >= db.CLAIM_INTERVAL,
+        "claimIn": max(0, db.CLAIM_INTERVAL - waited),
+        "dailyAmount": db.DAILY_CLAIM,
+        "stats": {
+            "wins": st["wins"],
+            "losses": st["losses"],
+            "pushes": st["pushes"],
+            "net": st["net"],
+            "wagered": st["wagered"],
+            "biggestWin": st["biggest_win"],
+            "streak": st["streak"],
+            "bestStreak": st["best_streak"],
+            "rank": db.rank_for(st["wins"]),
+            "nextRank": db.next_rank(st["wins"]),
+        },
+    }
+
+
+@route("GET", r"/api/wallet")
+def api_wallet(req):
+    req.require_auth()
+    return wallet_payload(req.conn, req.user["id"])
+
+
+@route("POST", r"/api/wallet/claim")
+def api_claim(req):
+    """The daily top-up. One per 24h, so nobody can farm it."""
+    req.require_auth()
+    row = req.conn.execute(
+        "SELECT coins, last_claim FROM users WHERE id = ?", (req.user["id"],)
+    ).fetchone()
+    waited = db.now() - row["last_claim"]
+    if waited < db.CLAIM_INTERVAL:
+        hours = (db.CLAIM_INTERVAL - waited) // 3600
+        mins = ((db.CLAIM_INTERVAL - waited) % 3600) // 60
+        when = f"{hours}h {mins}m" if hours else f"{mins}m"
+        raise HttpError(429, f"You've already claimed today. Come back in {when}.")
+    with req.conn:
+        req.conn.execute(
+            "UPDATE users SET coins = coins + ?, last_claim = ? WHERE id = ?",
+            (db.DAILY_CLAIM, db.now(), req.user["id"]),
+        )
+    return {"claimed": db.DAILY_CLAIM, **wallet_payload(req.conn, req.user["id"])}
+
+
+@route("GET", r"/api/guilds/(\d+)/bank")
+def api_bank(req, guild_id):
+    """Everyone's balance in this server, richest first."""
+    req.require_auth()
+    guild_id = int(guild_id)
+    guild_member_or_403(req, guild_id)
+    rows = req.conn.execute(
+        "SELECT u.*, COALESCE(s.wins, 0) wins FROM guild_members m"
+        " JOIN users u ON u.id = m.user_id"
+        " LEFT JOIN game_stats s ON s.user_id = u.id"
+        " WHERE m.guild_id = ? AND u.is_bot = 0"
+        " ORDER BY u.coins DESC, u.username COLLATE NOCASE",
+        (guild_id,),
+    ).fetchall()
+    return {
+        "accounts": [
+            {
+                "id": r["id"],
+                "username": r["username"],
+                "color": r["color"],
+                "avatarUrl": db.avatar_url(r),
+                "coins": r["coins"],
+                "rank": db.rank_for(r["wins"]),
+            }
+            for r in rows
+        ],
+        "total": sum(r["coins"] for r in rows),
+    }
+
+
+@route("GET", r"/api/guilds/(\d+)/leaderboard")
+def api_leaderboard(req, guild_id):
+    req.require_auth()
+    guild_id = int(guild_id)
+    guild_member_or_403(req, guild_id)
+    rows = req.conn.execute(
+        "SELECT u.id, u.username, u.color, u.avatar,"
+        " COALESCE(s.wins,0) wins, COALESCE(s.losses,0) losses,"
+        " COALESCE(s.net,0) net, COALESCE(s.best_streak,0) best_streak"
+        " FROM guild_members m JOIN users u ON u.id = m.user_id"
+        " LEFT JOIN game_stats s ON s.user_id = u.id"
+        " WHERE m.guild_id = ? AND u.is_bot = 0"
+        " ORDER BY wins DESC, net DESC, u.username COLLATE NOCASE LIMIT 25",
+        (guild_id,),
+    ).fetchall()
+    return {
+        "players": [
+            {
+                "id": r["id"],
+                "username": r["username"],
+                "color": r["color"],
+                "avatarUrl": f"/uploads/{r['avatar']}" if r["avatar"] else None,
+                "wins": r["wins"],
+                "losses": r["losses"],
+                "net": r["net"],
+                "bestStreak": r["best_streak"],
+                "rank": db.rank_for(r["wins"]),
+            }
+            for r in rows
+        ]
+    }
+
+
 # --------------------------------------------------------------- games API
 
 def serialize_game(conn, row, viewer_id):
     """Public view of a game, hiding what the viewer isn't allowed to see."""
     state = json.loads(row["state"])
     mode, status = row["mode"], row["status"]
+
+    if mode == "slots":
+        host = conn.execute("SELECT * FROM users WHERE id = ?", (row["host_id"],)).fetchone()
+        return {
+            "id": row["id"],
+            "mode": "slots",
+            "status": "finished",
+            "bet": row["bet"],
+            "reels": state["reels"],
+            "label": state["label"],
+            "payout": state["payout"],
+            "profit": state["profit"],
+            "player": db.public_user(host, db.is_online(host)) if host else None,
+            "yourSeat": "host" if viewer_id == row["host_id"] else None,
+        }
 
     def seat_of(uid):
         if uid == row["host_id"]:
@@ -1645,6 +1777,7 @@ def serialize_game(conn, row, viewer_id):
         "id": row["id"],
         "mode": mode,
         "status": status,
+        "bet": row["bet"],
         "seats": seats,
         "turn": state.get("turn"),
         "yourSeat": viewer_seat,
@@ -1654,6 +1787,73 @@ def serialize_game(conn, row, viewer_id):
         "result": result,
         "outcome": outcome,
     }
+
+
+MAX_BET = 1_000_000
+
+
+def take_bet(req, amount):
+    """Validate a stake and hold it out of the player's balance."""
+    try:
+        amount = int(amount or 0)
+    except (TypeError, ValueError):
+        raise HttpError(400, "That isn't a valid bet.")
+    if amount < 0:
+        raise HttpError(400, "A bet can't be negative.")
+    if amount > MAX_BET:
+        raise HttpError(400, f"The most you can stake is {MAX_BET:,}.")
+    if amount:
+        have = db.balance(req.conn, req.user["id"])
+        if amount > have:
+            raise HttpError(400,
+                            f"You only have {have:,} Sana Coin. Try /claim for a top-up.")
+        with req.conn:
+            db.adjust_coins(req.conn, req.user["id"], -amount)
+    return amount
+
+
+def settle_bets(conn, row, state):
+    """Pay out a finished hand exactly once, and record it in the stats."""
+    if row["settled"]:
+        return
+    bet, mode = row["bet"], row["mode"]
+    winner = state["result"]["winner"]
+    natural = blackjack.is_natural(state["hands"]["host"])
+
+    with conn:
+        conn.execute("UPDATE games SET settled = 1 WHERE id = ?", (row["id"],))
+
+        if mode == "cpu":
+            # Blackjack pays 3:2, an ordinary win pays even money.
+            if winner == "host":
+                gross = int(bet * 2.5) if natural else bet * 2
+            elif winner == "push":
+                gross = bet
+            else:
+                gross = 0
+            db.adjust_coins(conn, row["host_id"], gross)
+            outcome = {"host": "win", "push": "push"}.get(winner, "lose")
+            db.record_result(conn, row["host_id"], outcome, gross - bet, bet)
+            return
+
+        # pvp: both staked, so the winner takes the pot.
+        host, guest = row["host_id"], row["guest_id"]
+        if winner == "push":
+            db.adjust_coins(conn, host, bet)
+            if guest:
+                db.adjust_coins(conn, guest, bet)
+            db.record_result(conn, host, "push", 0, bet)
+            if guest:
+                db.record_result(conn, guest, "push", 0, bet)
+            return
+
+        won_by = host if winner == "host" else guest
+        lost_by = guest if winner == "host" else host
+        if won_by:
+            db.adjust_coins(conn, won_by, bet * 2)
+            db.record_result(conn, won_by, "win", bet, bet)
+        if lost_by:
+            db.record_result(conn, lost_by, "lose", -bet, bet)
 
 
 def post_game_message(req, channel_id, game_id):
@@ -1682,6 +1882,8 @@ def api_start_game(req, channel_id):
     if mode == "pvp" and ch["kind"] == "dm":
         raise HttpError(400, "Open a 1v1 in a server channel so others can join.")
 
+    bet = take_bet(req, req.body.get("bet"))
+
     state = blackjack.new_game(mode)
     if mode == "pvp":
         # Nobody plays until an opponent joins.
@@ -1693,14 +1895,18 @@ def api_start_game(req, channel_id):
     now = db.now()
     with req.conn:
         cur = req.conn.execute(
-            "INSERT INTO games (channel_id, mode, status, host_id, state,"
-            " created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-            (channel_id, mode, status, req.user["id"], json.dumps(state), now, now),
+            "INSERT INTO games (channel_id, mode, status, host_id, state, bet,"
+            " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (channel_id, mode, status, req.user["id"], json.dumps(state), bet, now, now),
         )
     gid = cur.lastrowid
+    if status == "finished":
+        row = req.conn.execute("SELECT * FROM games WHERE id = ?", (gid,)).fetchone()
+        settle_bets(req.conn, row, state)
     msg_id = post_game_message(req, channel_id, gid)
     mark_read(req.conn, req.user["id"], channel_id, msg_id)
-    return {"message": serialize_one(req.conn, msg_id, req.user["id"])}
+    return {"message": serialize_one(req.conn, msg_id, req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
 
 
 def load_game(req, game_id):
@@ -1718,7 +1924,56 @@ def save_game(req, row, state, status):
             " updated_at = ? WHERE id = ?",
             (json.dumps(state), status, db.now(), row["id"]),
         )
-    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"])}
+    if status == "finished":
+        fresh = req.conn.execute(
+            "SELECT * FROM games WHERE id = ?", (row["id"],)
+        ).fetchone()
+        settle_bets(req.conn, fresh, state)
+    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
+
+
+@route("POST", r"/api/channels/(\d+)/slots")
+def api_slots(req, channel_id):
+    """One pull of the slot machine, posted by the bot."""
+    req.require_auth()
+    channel_id = int(channel_id)
+    channel_access_or_403(req, channel_id)
+
+    bet = take_bet(req, req.body.get("bet"))
+    if bet < 10:
+        # Refund the stake we just held before rejecting.
+        if bet:
+            with req.conn:
+                db.adjust_coins(req.conn, req.user["id"], bet)
+        raise HttpError(400, "Minimum spin is 10 Sana Coin.")
+
+    result = slots.play(bet)
+    state = {
+        "kind": "slots",
+        "reels": result["reels"],
+        "label": result["label"],
+        "payout": result["payout"],
+        "profit": result["profit"],
+        "result": {"winner": "host" if result["won"] else "opp",
+                   "text": result["label"]},
+    }
+    now = db.now()
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO games (channel_id, mode, status, host_id, state, bet,"
+            " settled, created_at, updated_at) VALUES (?,?,?,?,?,?,1,?,?)",
+            (channel_id, "slots", "finished", req.user["id"], json.dumps(state),
+             bet, now, now),
+        )
+        db.adjust_coins(req.conn, req.user["id"], result["payout"])
+        outcome = "win" if result["won"] else ("push" if result["pushed"] else "lose")
+        db.record_result(req.conn, req.user["id"], outcome, result["profit"], bet)
+
+    msg_id = post_game_message(req, channel_id, cur.lastrowid)
+    mark_read(req.conn, req.user["id"], channel_id, msg_id)
+    return {"message": serialize_one(req.conn, msg_id, req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
 
 
 @route("POST", r"/api/games/(\d+)/join")
@@ -1732,6 +1987,14 @@ def api_join_game(req, game_id):
     if row["host_id"] == req.user["id"]:
         raise HttpError(400, "You can't join your own game — wait for someone else.")
 
+    # Joining means matching the host's stake.
+    bet = row["bet"]
+    if bet:
+        have = db.balance(req.conn, req.user["id"])
+        if have < bet:
+            raise HttpError(400,
+                            f"That table is {bet:,} Sana Coin and you have {have:,}.")
+
     state = json.loads(row["state"])
     state["turn"] = "host"
     with req.conn:
@@ -1744,7 +2007,12 @@ def api_join_game(req, game_id):
     fresh = req.conn.execute("SELECT * FROM games WHERE id = ?", (row["id"],)).fetchone()
     if fresh["guest_id"] != req.user["id"]:
         raise HttpError(409, "Someone else joined first.")
-    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"])}
+    # Only take the stake once the seat is definitely ours.
+    if bet:
+        with req.conn:
+            db.adjust_coins(req.conn, req.user["id"], -bet)
+    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
 
 
 @route("POST", r"/api/games/(\d+)/action")

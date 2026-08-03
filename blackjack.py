@@ -161,13 +161,24 @@ def settle(state, mode):
 
 
 def visible_hand(state, seat, mode, viewer_seat):
-    """Cards to show. The dealer's hole card stays face down mid-hand."""
+    """Cards this viewer is allowed to see.
+
+    Nothing is hidden once the hand has settled. Before then:
+
+    * cpu — the dealer keeps one card face down, as at a real table.
+    * pvp — you only ever see your own cards. Showing both would hand the
+      second player a decisive advantage, since they could read the total
+      they need before choosing to draw. Spectators see neither hand.
+    """
     cards = list(state["hands"][seat])
-    hidden = (
-        mode == "cpu"
-        and seat == "opp"
-        and state["result"] is None
-    )
-    if hidden and len(cards) > 1:
-        return cards[:1] + ["??"] * (len(cards) - 1)
+    if state["result"] is not None:
+        return cards
+
+    if mode == "cpu":
+        if seat == "opp" and len(cards) > 1:
+            return cards[:1] + ["??"] * (len(cards) - 1)
+        return cards
+
+    if seat != viewer_seat:
+        return ["??"] * len(cards)
     return cards

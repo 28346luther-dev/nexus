@@ -15,6 +15,7 @@ const state = {
   messages: [],
   replyTo: null,            // message being replied to, if any
   mentionable: [],          // members of the open channel, for @ autocomplete
+  wallet: null,             // Sana Coin balance, stats and claim cooldown
   rev: '',
   channelRev: '',           // fingerprint of the open channel (edits/reactions)
   homeTab: 'friends',       // 'friends' when no DM is open
@@ -619,13 +620,53 @@ function seatRow(seat, label, isTurn) {
   return wrap;
 }
 
+function slotsNode(g) {
+  const card = el('div', `game-card slots ${g.profit > 0 ? 'won' : ''}`.trim());
+  const head = el('div', 'game-head');
+  head.appendChild(el('span', 'game-title', 'Slot machine'));
+  head.appendChild(el('span', 'game-status', g.bet ? coins(g.bet) : 'for fun'));
+  card.appendChild(head);
+
+  const reels = el('div', 'reels');
+  g.reels.forEach((sym) => reels.appendChild(el('div', 'reel', sym)));
+  card.appendChild(reels);
+
+  const outcome = g.profit > 0 ? 'win' : (g.profit === 0 ? 'push' : 'lose');
+  const banner = el('div', `game-result ${outcome}`);
+  banner.appendChild(el('strong', null, g.profit > 0
+    ? `+${g.payout.toLocaleString()} ${COIN}`
+    : (g.profit === 0 ? 'Stake returned' : `-${g.bet.toLocaleString()} ${COIN}`)));
+  banner.appendChild(el('span', null, g.label));
+  card.appendChild(banner);
+
+  if (g.yourSeat) {
+    const actions = el('div', 'game-actions');
+    const again = el('button', 'btn small ghost', 'Spin again');
+    again.onclick = () => spinSlots(g.bet || 10);
+    actions.appendChild(again);
+    card.appendChild(actions);
+  }
+
+  const foot = el('div', 'game-foot');
+  foot.textContent = `${g.player ? g.player.username : 'someone'}'s spin`;
+  card.appendChild(foot);
+  return card;
+}
+
 function gameNode(m) {
   const g = m.game;
+  if (g.mode === 'slots') return slotsNode(g);
+
   const card = el('div', `game-card ${g.status}`.trim());
 
   const head = el('div', 'game-head');
   head.appendChild(el('span', 'game-title',
     g.mode === 'cpu' ? 'Blackjack' : 'Blackjack · 1v1'));
+  if (g.bet) {
+    const stake = el('span', 'game-stake', coins(g.bet));
+    stake.title = g.mode === 'pvp' ? `Pot: ${coins(g.bet * 2)}` : 'Your stake';
+    head.appendChild(stake);
+  }
   const status = el('span', 'game-status');
   if (g.status === 'waiting') status.textContent = 'Waiting for an opponent';
   else if (g.status === 'finished') status.textContent = 'Finished';
@@ -653,11 +694,13 @@ function gameNode(m) {
 
   const actions = el('div', 'game-actions');
   if (g.canJoin) {
-    const join = el('button', 'btn primary small', 'Join game');
+    const join = el('button', 'btn primary small',
+      g.bet ? `Join for ${coins(g.bet)}` : 'Join game');
     join.onclick = async () => {
       join.disabled = true;
       try {
         const data = await api('POST', `/api/games/${g.id}/join`);
+        if (data.wallet) state.wallet = data.wallet;
         replaceMessage(data.message);
       } catch (err) { toast(err.message, 'error'); join.disabled = false; }
     };
@@ -671,6 +714,7 @@ function gameNode(m) {
         [...actions.querySelectorAll('button')].forEach((x) => { x.disabled = true; });
         try {
           const data = await api('POST', `/api/games/${g.id}/action`, { action });
+          if (data.wallet) state.wallet = data.wallet;
           replaceMessage(data.message);
         } catch (err) {
           toast(err.message, 'error');
@@ -681,8 +725,9 @@ function gameNode(m) {
     });
   }
   if (g.status === 'finished' && g.yourSeat !== null) {
-    const again = el('button', 'btn small ghost', 'Play again');
-    again.onclick = () => startGame(g.mode);
+    const again = el('button', 'btn small ghost',
+      g.bet ? `Play again for ${coins(g.bet)}` : 'Play again');
+    again.onclick = () => startGame(g.mode, g.bet);
     actions.appendChild(again);
   }
   if (actions.children.length) card.appendChild(actions);
@@ -1374,18 +1419,60 @@ function playPing() {
 
 // ------------------------------------------------------------ slash commands
 
+const COIN = '💰';
+
+function coins(n) {
+  return `${Number(n).toLocaleString()} ${COIN}`;
+}
+
 const COMMANDS = [
   {
     name: '/blackjack',
     args: 'cpu',
     summary: 'Play a hand against the Gamesman',
-    run: () => startGame('cpu'),
+    takesNumber: true,
+    optionalNumber: true,
+    run: (bet) => askStake('Blackjack vs the Gamesman', bet, (n) => startGame('cpu', n)),
   },
   {
     name: '/blackjack',
     args: '1v1',
     summary: 'Open a 1v1 anyone in the server can join',
-    run: () => startGame('pvp'),
+    takesNumber: true,
+    optionalNumber: true,
+    run: (bet) => askStake('Blackjack 1v1', bet, (n) => startGame('pvp', n)),
+  },
+  {
+    name: '/slots',
+    args: '<bet>',
+    summary: 'Spin the slot machine',
+    takesNumber: true,
+    optionalNumber: true,
+    run: (bet) => askStake('Slot machine', bet, spinSlots, 10),
+  },
+  {
+    name: '/claim',
+    args: '',
+    summary: `Collect your daily ${COIN} Sana Coin`,
+    run: () => claimDaily(),
+  },
+  {
+    name: '/balance',
+    args: '',
+    summary: 'Your balance, rank and record',
+    run: () => showWallet(),
+  },
+  {
+    name: '/bank',
+    args: '',
+    summary: "Everyone's balances in this server",
+    run: () => showBank(),
+  },
+  {
+    name: '/leaderboard',
+    args: '',
+    summary: 'Top players by games won',
+    run: () => showLeaderboard(),
   },
   {
     name: '/purge',
@@ -1433,13 +1520,221 @@ function confirmPurge(count) {
     });
 }
 
-async function startGame(mode) {
+async function refreshWallet() {
+  try { state.wallet = await api('GET', '/api/wallet'); }
+  catch { /* not signed in yet */ }
+  return state.wallet;
+}
+
+/** "How much would you like to bet?" — skipped when the command carried one. */
+async function askStake(title, preset, onConfirm, min = 0) {
+  if (preset !== null && preset !== undefined) return onConfirm(preset);
+  const wallet = await refreshWallet();
+  const have = wallet ? wallet.coins : 0;
+
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, title));
+    box.appendChild(el('p', 'sub',
+      `How much would you like to bet? You have ${coins(have)}.`));
+
+    const form = el('form');
+    const label = el('label', 'field');
+    label.appendChild(el('span', null, 'Stake'));
+    const field = el('input');
+    field.type = 'number';
+    field.min = String(min);
+    field.max = String(have);
+    field.value = String(Math.min(Math.max(min, 100), have));
+    label.appendChild(field);
+    if (min) label.appendChild(el('small', null, `Minimum ${coins(min)}.`));
+    form.appendChild(label);
+
+    const quick = el('div', 'stake-quick');
+    [50, 100, 500, 1000].filter((n) => n >= min && n <= have).forEach((n) => {
+      const b = el('button', 'btn small ghost', n.toLocaleString());
+      b.type = 'button';
+      b.onclick = () => { field.value = String(n); };
+      quick.appendChild(b);
+    });
+    if (have >= min) {
+      const allIn = el('button', 'btn small ghost', 'All in');
+      allIn.type = 'button';
+      allIn.onclick = () => { field.value = String(have); };
+      quick.appendChild(allIn);
+    }
+    const none = el('button', 'btn small ghost', 'For fun');
+    none.type = 'button';
+    none.title = 'Play with nothing staked';
+    none.onclick = () => { close(); onConfirm(0); };
+    if (!min) quick.appendChild(none);
+    form.appendChild(quick);
+
+    const actions = el('div', 'modal-actions');
+    const cancel = el('button', 'btn ghost', 'Cancel');
+    cancel.type = 'button';
+    cancel.onclick = close;
+    const go = el('button', 'btn primary', 'Place bet');
+    actions.append(cancel, go);
+    form.appendChild(actions);
+
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      const n = parseInt(field.value, 10);
+      if (Number.isNaN(n) || n < min) {
+        toast(min ? `Minimum stake is ${coins(min)}.` : 'Enter a number.', 'error');
+        return;
+      }
+      if (n > have) {
+        toast(`You only have ${coins(have)}.`, 'error');
+        return;
+      }
+      close();
+      onConfirm(n);
+    };
+    box.appendChild(form);
+  });
+}
+
+async function startGame(mode, bet = 0) {
   if (!state.activeChannelId) return;
   try {
     const data = await api('POST', `/api/channels/${state.activeChannelId}/games`,
-      { mode });
+      { mode, bet });
+    if (data.wallet) state.wallet = data.wallet;
     pushMessage(data.message);
   } catch (err) { toast(err.message, 'error'); }
+}
+
+async function spinSlots(bet) {
+  if (!state.activeChannelId) return;
+  try {
+    const data = await api('POST', `/api/channels/${state.activeChannelId}/slots`,
+      { bet });
+    if (data.wallet) state.wallet = data.wallet;
+    pushMessage(data.message);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+async function claimDaily() {
+  try {
+    const data = await api('POST', '/api/wallet/claim');
+    state.wallet = data;
+    toast(`Claimed ${coins(data.claimed)} — you now have ${coins(data.coins)}.`, 'ok');
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+function statLine(label, value) {
+  const row = el('div', 'stat');
+  row.appendChild(el('span', 'stat-label', label));
+  row.appendChild(el('span', 'stat-value', value));
+  return row;
+}
+
+async function showWallet() {
+  const w = await refreshWallet();
+  if (!w) return;
+  openModal((box) => {
+    box.appendChild(el('h2', null, 'Your wallet'));
+    box.appendChild(el('p', 'sub', `${w.stats.rank} · ${coins(w.coins)}`));
+
+    const grid = el('div', 'stat-grid');
+    grid.appendChild(statLine('Won', String(w.stats.wins)));
+    grid.appendChild(statLine('Lost', String(w.stats.losses)));
+    grid.appendChild(statLine('Pushed', String(w.stats.pushes)));
+    grid.appendChild(statLine('Net', `${w.stats.net >= 0 ? '+' : ''}${w.stats.net.toLocaleString()}`));
+    grid.appendChild(statLine('Best win', w.stats.biggestWin.toLocaleString()));
+    grid.appendChild(statLine('Best streak', String(w.stats.bestStreak)));
+    box.appendChild(grid);
+
+    if (w.stats.nextRank) {
+      box.appendChild(el('p', 'muted',
+        `${w.stats.nextRank.winsAway} more win${w.stats.nextRank.winsAway === 1 ? '' : 's'}`
+        + ` to reach ${w.stats.nextRank.name}.`));
+    } else {
+      box.appendChild(el('p', 'muted', 'Top rank reached.'));
+    }
+
+    const claim = el('button', 'btn primary block', w.canClaim
+      ? `Claim ${coins(w.dailyAmount)}`
+      : `Next claim in ${formatWait(w.claimIn)}`);
+    claim.disabled = !w.canClaim;
+    claim.style.marginTop = '16px';
+    claim.onclick = async () => { closeModal(); await claimDaily(); };
+    box.appendChild(claim);
+  });
+}
+
+function formatWait(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+async function showBank() {
+  if (!state.activeGuildId) {
+    toast('Open a server to see its bank.', 'error');
+    return;
+  }
+  let data;
+  try { data = await api('GET', `/api/guilds/${state.activeGuildId}/bank`); }
+  catch (err) { return toast(err.message, 'error'); }
+
+  openModal((box) => {
+    box.appendChild(el('h2', null, 'Sana Coin bank'));
+    box.appendChild(el('p', 'sub',
+      `${coins(data.total)} in circulation across ${data.accounts.length} `
+      + `account${data.accounts.length === 1 ? '' : 's'}.`));
+    const list = el('div', 'rank-list');
+    data.accounts.forEach((a, i) => {
+      const row = el('div', 'rank-row');
+      row.appendChild(el('span', 'rank-pos', String(i + 1)));
+      row.appendChild(avatar(a));
+      const who = el('div', 'rank-who');
+      who.appendChild(el('strong', null, a.username));
+      who.appendChild(el('small', null, a.rank));
+      row.appendChild(who);
+      row.appendChild(el('span', 'rank-score', coins(a.coins)));
+      list.appendChild(row);
+    });
+    box.appendChild(list);
+  });
+}
+
+async function showLeaderboard() {
+  if (!state.activeGuildId) {
+    toast('Open a server to see its leaderboard.', 'error');
+    return;
+  }
+  let data;
+  try { data = await api('GET', `/api/guilds/${state.activeGuildId}/leaderboard`); }
+  catch (err) { return toast(err.message, 'error'); }
+
+  openModal((box) => {
+    box.appendChild(el('h2', null, 'Leaderboard'));
+    box.appendChild(el('p', 'sub', 'Ranked by games won.'));
+    if (!data.players.length) {
+      box.appendChild(el('p', 'muted', 'Nobody has played yet.'));
+      return;
+    }
+    const list = el('div', 'rank-list');
+    data.players.forEach((p, i) => {
+      const row = el('div', 'rank-row');
+      const pos = el('span', 'rank-pos', String(i + 1));
+      if (i < 3) pos.classList.add('podium');
+      row.appendChild(pos);
+      row.appendChild(avatar(p));
+      const who = el('div', 'rank-who');
+      who.appendChild(el('strong', null, p.username));
+      who.appendChild(el('small', null,
+        `${p.rank} · ${p.wins}W / ${p.losses}L · best streak ${p.bestStreak}`));
+      row.appendChild(who);
+      const net = el('span', `rank-score ${p.net >= 0 ? 'up' : 'down'}`,
+        `${p.net >= 0 ? '+' : ''}${p.net.toLocaleString()}`);
+      row.appendChild(net);
+      list.appendChild(row);
+    });
+    box.appendChild(list);
+  });
 }
 
 /** Match typed text against a command; null when it isn't one. */
@@ -1524,8 +1819,9 @@ function paintCommandSelection() {
 
 function runCommand(cmd, arg) {
   // A command that needs a number and hasn't got one yet: prefill the box and
-  // let them finish typing rather than firing with nothing.
-  if (cmd.takesNumber && (arg === null || arg === undefined)) {
+  // let them finish typing rather than firing with nothing. Commands where the
+  // number is optional (the stake) ask for it in a dialog instead.
+  if (cmd.takesNumber && !cmd.optionalNumber && (arg === null || arg === undefined)) {
     input.value = `${cmd.name} `;
     input.focus();
     input.setSelectionRange(input.value.length, input.value.length);
@@ -1848,11 +2144,13 @@ function totalMentions() {
 }
 
 async function refreshSidebarData() {
-  const [guilds, dms, friends] = await Promise.all([
+  const [guilds, dms, friends, wallet] = await Promise.all([
     api('GET', '/api/guilds'),
     api('GET', '/api/dms'),
     api('GET', '/api/friends'),
+    api('GET', '/api/wallet').catch(() => null),
   ]);
+  if (wallet) state.wallet = wallet;
   state.guilds = guilds.guilds;
   state.dms = dms.dms;
   state.friends = friends;
