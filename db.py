@@ -184,6 +184,19 @@ CREATE TABLE IF NOT EXISTS stickers (
 );
 CREATE INDEX IF NOT EXISTS idx_stickers_guild ON stickers(guild_id);
 
+-- Saved GIFs. Only the URLs Giphy gave us are kept; nothing is re-hosted.
+CREATE TABLE IF NOT EXISTS gif_favourites (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    gif_id     TEXT NOT NULL,
+    title      TEXT NOT NULL DEFAULT '',
+    preview    TEXT NOT NULL,
+    url        TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (user_id, gif_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gif_fav_user ON gif_favourites(user_id, id DESC);
+
 -- Running totals per player for the Gamesman leaderboard.
 CREATE TABLE IF NOT EXISTS game_stats (
     user_id     INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,

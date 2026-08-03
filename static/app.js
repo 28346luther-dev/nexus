@@ -474,6 +474,7 @@ function messageNode(m, grouped) {
     head.appendChild(el('span', 'msg-time', stampLabel(m.createdAt)));
     body.appendChild(head);
   }
+  const gifUrl = loneGifUrl(m.content);
   const text = el('div', 'msg-text');
   text.innerHTML = formatContent(m.content);
   if (m.editedAt) {
@@ -481,7 +482,8 @@ function messageNode(m, grouped) {
     tag.title = stampLabel(m.editedAt);
     text.appendChild(tag);
   }
-  if (m.content) body.appendChild(text);
+  if (m.content && !gifUrl) body.appendChild(text);
+  if (gifUrl) body.appendChild(gifNode(gifUrl));
 
   if (m.game) body.appendChild(gameNode(m));
   if (m.sticker) body.appendChild(stickerNode(m.sticker));
@@ -578,6 +580,29 @@ function cancelReply() {
 
 $('#reply-cancel').onclick = cancelReply;
 
+// ------------------------------------------------------------------- GIFs
+
+// A message that is nothing but a Giphy link renders as the GIF itself.
+// Restricted to Giphy's own media hosts so an arbitrary link can't be turned
+// into an inline image by anyone who works out the format.
+const GIF_URL_RE = /^https:\/\/(?:[a-z0-9-]+\.)?giphy\.com\/media\/[^\s]+\.gif$/i;
+
+function loneGifUrl(content) {
+  const trimmed = (content || '').trim();
+  return GIF_URL_RE.test(trimmed) ? trimmed : null;
+}
+
+function gifNode(url) {
+  const wrap = el('div', 'attachment gif');
+  const img = el('img');
+  img.src = url;
+  img.alt = 'GIF';
+  img.loading = 'lazy';
+  img.onclick = () => openLightbox({ url, name: 'GIF', size: 0 });
+  wrap.appendChild(img);
+  return wrap;
+}
+
 // ------------------------------------------------------------ blackjack card
 
 const RED_SUITS = ['♥', '♦'];
@@ -653,8 +678,183 @@ function slotsNode(g) {
   return card;
 }
 
+const STAGE_LABEL = {
+  waiting: 'Waiting for players',
+  flop: 'Flop',
+  turn: 'Turn',
+  river: 'River',
+  showdown: 'Showdown',
+};
+
+function pokerNode(g) {
+  const card = el('div', `game-card poker ${g.stage}`.trim());
+
+  const head = el('div', 'game-head');
+  head.appendChild(el('span', 'game-title', "Poker · Hold'em"));
+  if (g.ante) head.appendChild(el('span', 'game-stake', coins(g.ante)));
+  head.appendChild(el('span', 'game-status',
+    `${STAGE_LABEL[g.stage]} · pot ${g.pot.toLocaleString()} ${COIN}`));
+  card.appendChild(head);
+
+  if (g.board.length) {
+    const boardRow = el('div', 'poker-board');
+    g.board.forEach((c) => boardRow.appendChild(cardNode(c)));
+    card.appendChild(boardRow);
+  }
+
+  const seats = el('div', 'poker-seats');
+  g.seats.forEach((s) => {
+    const row = el('div', 'poker-seat');
+    if (s.folded) row.classList.add('folded');
+    if (s.won) row.classList.add('winner');
+    if (s.isYou) row.classList.add('you');
+
+    const who = el('div', 'poker-who');
+    if (s.user) who.appendChild(avatar({ ...s.user, online: undefined }, 'xs'));
+    who.appendChild(el('span', 'poker-name', s.user ? s.user.username : '—'));
+    if (s.folded) who.appendChild(el('span', 'seat-flag', 'FOLD'));
+    else if (s.acted && g.stage !== 'showdown') who.appendChild(el('span', 'seat-flag', 'IN'));
+    if (s.won) who.appendChild(el('span', 'seat-flag win-flag', 'WON'));
+    row.appendChild(who);
+
+    const hand = el('div', 'poker-hole');
+    s.hole.forEach((c) => hand.appendChild(cardNode(c)));
+    row.appendChild(hand);
+
+    if (s.hand) row.appendChild(el('span', 'poker-hand-name', s.hand.name));
+    seats.appendChild(row);
+  });
+  card.appendChild(seats);
+
+  if (g.result) {
+    const iWon = g.seats.some((s) => s.isYou && s.won);
+    const banner = el('div', `game-result ${iWon ? 'win' : (g.youArePlaying ? 'lose' : '')}`.trim());
+    const names = g.seats.filter((s) => s.won).map((s) => (s.user ? s.user.username : '?'));
+    banner.appendChild(el('strong', null, iWon
+      ? `You won ${g.result.share.toLocaleString()} ${COIN}`
+      : `${names.join(' & ')} won ${g.result.share.toLocaleString()} ${COIN}`));
+    banner.appendChild(el('span', null, g.result.text));
+    card.appendChild(banner);
+  }
+
+  const actions = el('div', 'game-actions');
+  if (g.canJoin) {
+    const join = el('button', 'btn primary small', `Sit down for ${coins(g.ante)}`);
+    join.onclick = () => pokerCall(g.id, 'join');
+    actions.appendChild(join);
+  }
+  if (g.canDeal) {
+    const deal = el('button', 'btn primary small', 'Deal');
+    deal.onclick = () => pokerCall(g.id, 'deal');
+    actions.appendChild(deal);
+  }
+  if (g.yourTurn) {
+    const stay = el('button', 'btn primary small', `Stay (${coins(g.ante)})`);
+    stay.onclick = () => pokerCall(g.id, 'action', { action: 'stay' });
+    const fold = el('button', 'btn small', 'Fold');
+    fold.onclick = () => pokerCall(g.id, 'action', { action: 'fold' });
+    actions.append(stay, fold);
+  }
+  if (g.stage === 'showdown' && g.youArePlaying) {
+    const bots = g.seats.filter((s) => s.user && s.user.isBot).length;
+    const again = el('button', 'btn small ghost', 'New hand');
+    again.onclick = () => startPoker(g.ante, bots);
+    actions.appendChild(again);
+  }
+  if (actions.children.length) card.appendChild(actions);
+
+  const host = g.seats.find((s) => s.user && s.user.id === g.hostId);
+  card.appendChild(el('div', 'game-foot',
+    `${host && host.user ? host.user.username : 'someone'}'s table`));
+  return card;
+}
+
+function statLine(label, value) {
+  const row = el('div', 'stat');
+  row.appendChild(el('span', 'stat-label', label));
+  row.appendChild(el('span', 'stat-value', value));
+  return row;
+}
+
+function infoCardNode(g) {
+  const card = el('div', 'game-card info');
+  const head = el('div', 'game-head');
+  const titles = {
+    claim: 'Daily claim', balance: 'Wallet',
+    bank: 'Sana Coin bank', leaderboard: 'Leaderboard',
+  };
+  head.appendChild(el('span', 'game-title', titles[g.kind] || 'Gamesman'));
+  card.appendChild(head);
+
+  if (g.kind === 'claim' || g.kind === 'balance') {
+    const top = el('div', 'wallet-top');
+    if (g.player) top.appendChild(avatar({ ...g.player, online: undefined }, 'lg'));
+    const meta = el('div');
+    meta.appendChild(el('strong', null, g.player ? g.player.username : 'You'));
+    meta.appendChild(el('div', 'muted', `${g.stats.rank} · ${coins(g.coins)}`));
+    top.appendChild(meta);
+    card.appendChild(top);
+
+    if (g.kind === 'claim') {
+      const b = el('div', 'game-result win');
+      b.appendChild(el('strong', null, `+${g.claimed.toLocaleString()} ${COIN}`));
+      b.appendChild(el('span', null, 'Daily claim collected. Come back tomorrow.'));
+      card.appendChild(b);
+    }
+
+    const grid = el('div', 'stat-grid');
+    grid.appendChild(statLine('Won', String(g.stats.wins)));
+    grid.appendChild(statLine('Lost', String(g.stats.losses)));
+    grid.appendChild(statLine('Pushed', String(g.stats.pushes)));
+    grid.appendChild(statLine('Net',
+      `${g.stats.net >= 0 ? '+' : ''}${g.stats.net.toLocaleString()}`));
+    grid.appendChild(statLine('Best win', g.stats.biggestWin.toLocaleString()));
+    grid.appendChild(statLine('Best streak', String(g.stats.bestStreak)));
+    card.appendChild(grid);
+
+    if (g.kind === 'balance') {
+      card.appendChild(el('div', 'game-foot', g.canClaim
+        ? 'Daily claim is ready — use /claim'
+        : `Next claim in ${formatWait(g.claimIn)}`));
+    }
+    return card;
+  }
+
+  const rows = g.kind === 'bank' ? g.accounts : g.players;
+  if (g.kind === 'bank') {
+    card.appendChild(el('p', 'muted',
+      `${coins(g.total)} across ${rows.length} account${rows.length === 1 ? '' : 's'}.`));
+  }
+  const list = el('div', 'rank-list');
+  (rows || []).forEach((r, i) => {
+    const row = el('div', 'rank-row');
+    const pos = el('span', 'rank-pos', String(i + 1));
+    if (i < 3) pos.classList.add('podium');
+    row.appendChild(pos);
+    row.appendChild(avatar({ ...r, online: undefined }));
+    const who = el('div', 'rank-who');
+    who.appendChild(el('strong', null, r.username));
+    who.appendChild(el('small', null, g.kind === 'bank'
+      ? r.rank
+      : `${r.rank} · ${r.wins}W / ${r.losses}L · best streak ${r.bestStreak}`));
+    row.appendChild(who);
+    if (g.kind === 'bank') {
+      row.appendChild(el('span', 'rank-score', coins(r.coins)));
+    } else {
+      row.appendChild(el('span', `rank-score ${r.net >= 0 ? 'up' : 'down'}`,
+        `${r.net >= 0 ? '+' : ''}${r.net.toLocaleString()}`));
+    }
+    list.appendChild(row);
+  });
+  if (!rows || !rows.length) list.appendChild(el('p', 'muted', 'Nobody has played yet.'));
+  card.appendChild(list);
+  return card;
+}
+
 function gameNode(m) {
   const g = m.game;
+  if (g.mode === 'info') return infoCardNode(g);
+  if (g.mode === 'poker') return pokerNode(g);
   if (g.mode === 'slots') return slotsNode(g);
 
   const card = el('div', `game-card ${g.status}`.trim());
@@ -1443,12 +1643,35 @@ const COMMANDS = [
     run: (bet) => askStake('Blackjack 1v1', bet, (n) => startGame('pvp', n)),
   },
   {
+    name: '/poker',
+    args: 'cpu',
+    summary: "Hold'em against three house players",
+    takesNumber: true,
+    optionalNumber: true,
+    run: (bet) => askStake('Poker vs the house', bet, (n) => startPoker(n, 3), 10),
+  },
+  {
+    name: '/poker',
+    args: 'table',
+    summary: "Open a Hold'em table others can sit at",
+    takesNumber: true,
+    optionalNumber: true,
+    run: (bet) => askStake('Poker table', bet, (n) => startPoker(n, 0), 10),
+  },
+  {
     name: '/slots',
     args: '<bet>',
     summary: 'Spin the slot machine',
     takesNumber: true,
     optionalNumber: true,
     run: (bet) => askStake('Slot machine', bet, spinSlots, 10),
+  },
+  {
+    name: '/gif',
+    args: '<search>',
+    summary: 'Search Giphy and send a GIF',
+    takesText: true,
+    run: (term) => openGifPicker(term),
   },
   {
     name: '/claim',
@@ -1605,6 +1828,151 @@ async function startGame(mode, bet = 0) {
   } catch (err) { toast(err.message, 'error'); }
 }
 
+async function startPoker(bet, bots) {
+  if (!state.activeChannelId) return;
+  try {
+    const data = await api('POST', `/api/channels/${state.activeChannelId}/poker`,
+      { bet, bots });
+    if (data.wallet) state.wallet = data.wallet;
+    pushMessage(data.message);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+async function pokerCall(gameId, path, body) {
+  try {
+    const data = await api('POST', `/api/games/${gameId}/poker/${path}`, body);
+    if (data.wallet) state.wallet = data.wallet;
+    replaceMessage(data.message);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+// ---------------------------------------------------------------- GIF picker
+
+async function toggleFavourite(gif) {
+  try {
+    const res = await api('POST', '/api/gifs/favourites', {
+      id: gif.id, url: gif.full || gif.url, preview: gif.preview, title: gif.title,
+    });
+    gif.favourite = res.favourite;
+    return res.favourite;
+  } catch (err) { toast(err.message, 'error'); return gif.favourite; }
+}
+
+async function openGifPicker(term) {
+  if (!state.activeChannelId) {
+    toast('Open a channel first.', 'error');
+    return;
+  }
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Send a GIF'));
+    box.appendChild(el('p', 'sub', 'Powered by Giphy. Tap ★ to keep one.'));
+
+    const tabs = el('div', 'tabs gif-tabs');
+    const searchTab = el('button', 'tab active', 'Search');
+    const favTab = el('button', 'tab', '★ Favourites');
+    tabs.append(searchTab, favTab);
+    box.appendChild(tabs);
+
+    const form = el('form', 'inline-form');
+    const field = el('input');
+    field.placeholder = 'Search Giphy…';
+    field.value = term || '';
+    const go = el('button', 'btn primary', 'Search');
+    form.append(field, go);
+    box.appendChild(form);
+
+    const grid = el('div', 'gif-grid');
+    box.appendChild(grid);
+
+    let token = 0;
+    let favourites = new Set();
+
+    function tile(g) {
+      const cell = el('div', 'gif-choice');
+      const img = el('img');
+      img.src = g.preview;
+      img.alt = g.title || 'GIF';
+      img.loading = 'lazy';
+      cell.appendChild(img);
+      cell.title = g.title || 'GIF';
+
+      const star = el('button', 'gif-star', '★');
+      const paint = () => {
+        const on = g.favourite || favourites.has(g.id);
+        star.classList.toggle('on', !!on);
+        star.title = on ? 'Remove from favourites' : 'Save to favourites';
+      };
+      paint();
+      star.onclick = async (e) => {
+        e.stopPropagation();
+        const now = await toggleFavourite(g);
+        if (now) favourites.add(g.id); else favourites.delete(g.id);
+        paint();
+      };
+      cell.appendChild(star);
+
+      cell.onclick = async () => { close(); await sendGif(g); };
+      return cell;
+    }
+
+    async function render(loader, emptyText) {
+      const mine = ++token;
+      grid.replaceChildren(el('p', 'muted', 'Loading…'));
+      try {
+        const data = await loader();
+        if (mine !== token) return;              // a newer request won
+        grid.replaceChildren();
+        if (!data.gifs.length) {
+          grid.appendChild(el('p', 'muted', emptyText));
+          return;
+        }
+        data.gifs.forEach((g) => grid.appendChild(tile(g)));
+      } catch (err) {
+        if (mine !== token) return;
+        grid.replaceChildren(el('p', 'muted', err.message));
+      }
+    }
+
+    async function loadFavourites() {
+      try {
+        const data = await api('GET', '/api/gifs/favourites');
+        favourites = new Set(data.gifs.map((g) => g.id));
+        return data;
+      } catch { return { gifs: [] }; }
+    }
+
+    const showSearch = (q) => {
+      searchTab.classList.add('active');
+      favTab.classList.remove('active');
+      form.hidden = false;
+      render(async () => {
+        await loadFavourites();
+        return api('GET', `/api/gifs?q=${encodeURIComponent(q || '')}`);
+      }, 'Nothing found. Try another search.');
+    };
+    const showFavourites = () => {
+      favTab.classList.add('active');
+      searchTab.classList.remove('active');
+      form.hidden = true;
+      render(loadFavourites, 'No favourites yet — tap ★ on a GIF to keep it.');
+    };
+
+    searchTab.onclick = () => showSearch(field.value.trim());
+    favTab.onclick = showFavourites;
+    form.onsubmit = (e) => { e.preventDefault(); showSearch(field.value.trim()); };
+    showSearch(term || '');
+  });
+}
+
+async function sendGif(gif) {
+  // Sent as a message holding the URL; the renderer shows it inline.
+  try {
+    const data = await api('POST', `/api/channels/${state.activeChannelId}/messages`,
+      { content: gif.full || gif.url });
+    pushMessage(data.message);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
 async function spinSlots(bet) {
   if (!state.activeChannelId) return;
   try {
@@ -1615,126 +1983,29 @@ async function spinSlots(bet) {
   } catch (err) { toast(err.message, 'error'); }
 }
 
-async function claimDaily() {
+/** The Gamesman answers these in-channel rather than in a local dialog. */
+async function gamesmanCard(kind) {
+  if (!state.activeChannelId) {
+    toast('Open a channel first.', 'error');
+    return;
+  }
   try {
-    const data = await api('POST', '/api/wallet/claim');
-    state.wallet = data;
-    toast(`Claimed ${coins(data.claimed)} — you now have ${coins(data.coins)}.`, 'ok');
+    const data = await api('POST', `/api/channels/${state.activeChannelId}/gamesman`,
+      { kind });
+    if (data.wallet) state.wallet = data.wallet;
+    pushMessage(data.message);
   } catch (err) { toast(err.message, 'error'); }
 }
 
-function statLine(label, value) {
-  const row = el('div', 'stat');
-  row.appendChild(el('span', 'stat-label', label));
-  row.appendChild(el('span', 'stat-value', value));
-  return row;
-}
-
-async function showWallet() {
-  const w = await refreshWallet();
-  if (!w) return;
-  openModal((box) => {
-    box.appendChild(el('h2', null, 'Your wallet'));
-    box.appendChild(el('p', 'sub', `${w.stats.rank} · ${coins(w.coins)}`));
-
-    const grid = el('div', 'stat-grid');
-    grid.appendChild(statLine('Won', String(w.stats.wins)));
-    grid.appendChild(statLine('Lost', String(w.stats.losses)));
-    grid.appendChild(statLine('Pushed', String(w.stats.pushes)));
-    grid.appendChild(statLine('Net', `${w.stats.net >= 0 ? '+' : ''}${w.stats.net.toLocaleString()}`));
-    grid.appendChild(statLine('Best win', w.stats.biggestWin.toLocaleString()));
-    grid.appendChild(statLine('Best streak', String(w.stats.bestStreak)));
-    box.appendChild(grid);
-
-    if (w.stats.nextRank) {
-      box.appendChild(el('p', 'muted',
-        `${w.stats.nextRank.winsAway} more win${w.stats.nextRank.winsAway === 1 ? '' : 's'}`
-        + ` to reach ${w.stats.nextRank.name}.`));
-    } else {
-      box.appendChild(el('p', 'muted', 'Top rank reached.'));
-    }
-
-    const claim = el('button', 'btn primary block', w.canClaim
-      ? `Claim ${coins(w.dailyAmount)}`
-      : `Next claim in ${formatWait(w.claimIn)}`);
-    claim.disabled = !w.canClaim;
-    claim.style.marginTop = '16px';
-    claim.onclick = async () => { closeModal(); await claimDaily(); };
-    box.appendChild(claim);
-  });
-}
+const claimDaily = () => gamesmanCard('claim');
+const showWallet = () => gamesmanCard('balance');
+const showBank = () => gamesmanCard('bank');
+const showLeaderboard = () => gamesmanCard('leaderboard');
 
 function formatWait(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   return h ? `${h}h ${m}m` : `${m}m`;
-}
-
-async function showBank() {
-  if (!state.activeGuildId) {
-    toast('Open a server to see its bank.', 'error');
-    return;
-  }
-  let data;
-  try { data = await api('GET', `/api/guilds/${state.activeGuildId}/bank`); }
-  catch (err) { return toast(err.message, 'error'); }
-
-  openModal((box) => {
-    box.appendChild(el('h2', null, 'Sana Coin bank'));
-    box.appendChild(el('p', 'sub',
-      `${coins(data.total)} in circulation across ${data.accounts.length} `
-      + `account${data.accounts.length === 1 ? '' : 's'}.`));
-    const list = el('div', 'rank-list');
-    data.accounts.forEach((a, i) => {
-      const row = el('div', 'rank-row');
-      row.appendChild(el('span', 'rank-pos', String(i + 1)));
-      row.appendChild(avatar(a));
-      const who = el('div', 'rank-who');
-      who.appendChild(el('strong', null, a.username));
-      who.appendChild(el('small', null, a.rank));
-      row.appendChild(who);
-      row.appendChild(el('span', 'rank-score', coins(a.coins)));
-      list.appendChild(row);
-    });
-    box.appendChild(list);
-  });
-}
-
-async function showLeaderboard() {
-  if (!state.activeGuildId) {
-    toast('Open a server to see its leaderboard.', 'error');
-    return;
-  }
-  let data;
-  try { data = await api('GET', `/api/guilds/${state.activeGuildId}/leaderboard`); }
-  catch (err) { return toast(err.message, 'error'); }
-
-  openModal((box) => {
-    box.appendChild(el('h2', null, 'Leaderboard'));
-    box.appendChild(el('p', 'sub', 'Ranked by games won.'));
-    if (!data.players.length) {
-      box.appendChild(el('p', 'muted', 'Nobody has played yet.'));
-      return;
-    }
-    const list = el('div', 'rank-list');
-    data.players.forEach((p, i) => {
-      const row = el('div', 'rank-row');
-      const pos = el('span', 'rank-pos', String(i + 1));
-      if (i < 3) pos.classList.add('podium');
-      row.appendChild(pos);
-      row.appendChild(avatar(p));
-      const who = el('div', 'rank-who');
-      who.appendChild(el('strong', null, p.username));
-      who.appendChild(el('small', null,
-        `${p.rank} · ${p.wins}W / ${p.losses}L · best streak ${p.bestStreak}`));
-      row.appendChild(who);
-      const net = el('span', `rank-score ${p.net >= 0 ? 'up' : 'down'}`,
-        `${p.net >= 0 ? '+' : ''}${p.net.toLocaleString()}`);
-      row.appendChild(net);
-      list.appendChild(row);
-    });
-    box.appendChild(list);
-  });
 }
 
 /** Match typed text against a command; null when it isn't one. */
@@ -1745,7 +2016,20 @@ function matchCommand(text) {
   const verb = verbRaw.toLowerCase();
   const tail = rest.join(' ').toLowerCase();
 
-  const numeric = COMMANDS.find((c) => c.name === verb && c.takesNumber);
+  const textual = COMMANDS.find((c) => c.name === verb && c.takesText);
+  if (textual) return { cmd: textual, arg: rest.join(' ').trim() || null };
+
+  // "/poker cpu 500" — variant word first, then the stake.
+  const variant = COMMANDS.find(
+    (c) => c.name === verb && c.takesNumber && c.args && !c.args.startsWith('<')
+           && rest.length && rest[0].toLowerCase() === c.args);
+  if (variant) {
+    const n = parseInt(rest[1], 10);
+    return { cmd: variant, arg: Number.isNaN(n) ? null : n };
+  }
+
+  const numeric = COMMANDS.find((c) => c.name === verb && c.takesNumber
+                                       && (!c.args || c.args.startsWith('<')));
   if (numeric) {
     const n = parseInt(tail, 10);
     return { cmd: numeric, arg: Number.isNaN(n) ? null : n };

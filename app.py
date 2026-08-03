@@ -16,14 +16,18 @@ import re
 import secrets
 import select
 import socket
+import ssl
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 import blackjack
 import db
 import images
+import poker
 import slots
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1587,6 +1591,140 @@ def api_open_dm(req):
     return {"channelId": cid}
 
 
+# ----------------------------------------------------------------- GIF API
+
+GIPHY_KEY = os.environ.get("GIPHY_API_KEY", "")
+GIPHY_TIMEOUT = 6
+# Giphy's own demo key is public and heavily throttled; it is only a fallback
+# so the picker degrades to an error message instead of silently breaking.
+GIPHY_ENDPOINTS = {
+    "search": "https://api.giphy.com/v1/gifs/search",
+    "trending": "https://api.giphy.com/v1/gifs/trending",
+}
+
+
+@route("GET", r"/api/gifs")
+def api_gifs(req):
+    """Proxy Giphy so the API key never reaches a browser.
+
+    Only the handful of fields the picker needs are passed back, and the
+    search term is length-capped before it leaves us.
+    """
+    req.require_auth()
+    if not GIPHY_KEY:
+        raise HttpError(503, "GIFs aren't configured — set GIPHY_API_KEY on the server.")
+
+    query = (req.query.get("q", [""])[0] or "").strip()[:80]
+    kind = "search" if query else "trending"
+    params = {
+        "api_key": GIPHY_KEY,
+        "limit": "24",
+        "rating": "pg-13",
+        "bundle": "messaging_non_clips",
+    }
+    if query:
+        params["q"] = query
+
+    url = f"{GIPHY_ENDPOINTS[kind]}?{urlencode(params)}"
+    try:
+        with urllib.request.urlopen(url, timeout=GIPHY_TIMEOUT) as res:
+            payload = json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise HttpError(502, "Giphy rejected the API key.")
+        if exc.code == 429:
+            raise HttpError(502, "Giphy is rate limiting us — try again shortly.")
+        raise HttpError(502, "Giphy is not responding right now.")
+    except urllib.error.URLError as exc:
+        # A Python install with no CA bundle can't verify any certificate. It
+        # bites on macOS python.org builds and looks exactly like an outage,
+        # so say what it actually is.
+        if isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
+            raise HttpError(
+                502,
+                "This server can't verify HTTPS certificates, so Giphy is"
+                " unreachable. On macOS run the 'Install Certificates.command'"
+                " that ships with Python, or set SSL_CERT_FILE=/etc/ssl/cert.pem.",
+            )
+        raise HttpError(502, "Giphy is not responding right now.")
+    except (TimeoutError, json.JSONDecodeError):
+        raise HttpError(502, "Giphy is not responding right now.")
+
+    gifs = []
+    for item in payload.get("data", []):
+        images = item.get("images") or {}
+        still = (images.get("fixed_width_still") or {}).get("url")
+        anim = (images.get("fixed_width_downsampled")
+                or images.get("fixed_width") or {}).get("url")
+        full = (images.get("original") or {}).get("url")
+        if not anim or not full:
+            continue
+        gifs.append({
+            "id": item.get("id"),
+            "title": (item.get("title") or "GIF")[:120],
+            "preview": still or anim,
+            "url": anim,
+            "full": full,
+            "width": int((images.get("fixed_width") or {}).get("width") or 200),
+            "height": int((images.get("fixed_width") or {}).get("height") or 200),
+        })
+    return {"gifs": gifs, "query": query}
+
+
+MAX_FAVOURITES = 100
+
+
+@route("GET", r"/api/gifs/favourites")
+def api_list_favourites(req):
+    req.require_auth()
+    rows = req.conn.execute(
+        "SELECT * FROM gif_favourites WHERE user_id = ? ORDER BY id DESC",
+        (req.user["id"],),
+    ).fetchall()
+    return {
+        "gifs": [
+            {"id": r["gif_id"], "title": r["title"],
+             "preview": r["preview"], "url": r["url"], "full": r["url"],
+             "favourite": True}
+            for r in rows
+        ]
+    }
+
+
+@route("POST", r"/api/gifs/favourites")
+def api_add_favourite(req):
+    """Toggle: favouriting one you already saved removes it."""
+    req.require_auth()
+    gif_id = str(req.field("id", maxlen=120))
+    existing = req.conn.execute(
+        "SELECT id FROM gif_favourites WHERE user_id = ? AND gif_id = ?",
+        (req.user["id"], gif_id),
+    ).fetchone()
+    if existing:
+        with req.conn:
+            req.conn.execute("DELETE FROM gif_favourites WHERE id = ?", (existing["id"],))
+        return {"favourite": False}
+
+    count = req.conn.execute(
+        "SELECT COUNT(*) c FROM gif_favourites WHERE user_id = ?", (req.user["id"],)
+    ).fetchone()["c"]
+    if count >= MAX_FAVOURITES:
+        raise HttpError(400, f"You can save up to {MAX_FAVOURITES} GIFs.")
+
+    url = str(req.field("url", maxlen=500))
+    preview = str(req.body.get("preview") or url)[:500]
+    if not url.startswith("https://"):
+        raise HttpError(400, "That doesn't look like a GIF address.")
+    with req.conn:
+        req.conn.execute(
+            "INSERT INTO gif_favourites (user_id, gif_id, title, preview, url,"
+            " created_at) VALUES (?,?,?,?,?,?)",
+            (req.user["id"], gif_id, str(req.body.get("title") or "")[:120],
+             preview, url, db.now()),
+        )
+    return {"favourite": True}
+
+
 # ------------------------------------------------------------ Sana Coin API
 
 def wallet_payload(conn, user_id):
@@ -1709,6 +1847,12 @@ def serialize_game(conn, row, viewer_id):
     """Public view of a game, hiding what the viewer isn't allowed to see."""
     state = json.loads(row["state"])
     mode, status = row["mode"], row["status"]
+
+    if mode == "info":
+        return {"id": row["id"], "mode": "info", "status": "finished", **state}
+
+    if mode == "poker":
+        return serialize_poker(conn, row, viewer_id)
 
     if mode == "slots":
         host = conn.execute("SELECT * FROM users WHERE id = ?", (row["host_id"],)).fetchone()
@@ -1931,6 +2075,301 @@ def save_game(req, row, state, status):
         settle_bets(req.conn, fresh, state)
     return {"message": serialize_one(req.conn, row["message_id"], req.user["id"]),
             "wallet": wallet_payload(req.conn, req.user["id"])}
+
+
+def serialize_poker(conn, row, viewer_id):
+    state = json.loads(row["state"])
+    people = {}
+    for p in state["players"]:
+        if p.get("cpu"):
+            people[p["userId"]] = {
+                "id": p["userId"],
+                "username": p.get("name") or "House",
+                "color": db.BOT_COLOR,
+                "avatarUrl": None,
+                "isBot": True,
+            }
+            continue
+        u = conn.execute("SELECT * FROM users WHERE id = ?", (p["userId"],)).fetchone()
+        if u:
+            people[p["userId"]] = db.public_user(u, db.is_online(u))
+
+    done = state["stage"] == "showdown"
+    seats = []
+    for p in state["players"]:
+        mine = p["userId"] == viewer_id
+        # Hole cards are yours alone until the showdown.
+        if done and not p["folded"]:
+            hole = p["hole"]
+        elif mine:
+            hole = p["hole"]
+        else:
+            hole = ["??"] * len(p["hole"])
+        entry = {
+            "user": people.get(p["userId"]),
+            "hole": hole,
+            "folded": p["folded"],
+            "acted": p["acted"],
+            "contributed": p["contributed"],
+            "isYou": mine,
+        }
+        if done and state["result"]:
+            hand = (state["result"].get("hands") or {}).get(str(p["userId"]))
+            if hand:
+                entry["hand"] = hand
+            entry["won"] = p["userId"] in state["result"]["winners"]
+        seats.append(entry)
+
+    me = poker.seat(state, viewer_id)
+    return {
+        "id": row["id"],
+        "mode": "poker",
+        "status": row["status"],
+        "stage": state["stage"],
+        "board": state["board"],
+        "pot": state["pot"],
+        "ante": state["ante"],
+        "bet": state["ante"],
+        "seats": seats,
+        "hostId": row["host_id"],
+        "isHost": viewer_id == row["host_id"],
+        "youArePlaying": me is not None,
+        "yourTurn": bool(me and not me["folded"] and not me["acted"]
+                         and state["stage"] not in ("waiting", "showdown")),
+        "canJoin": state["stage"] == "waiting" and me is None
+                   and len(state["players"]) < poker.MAX_PLAYERS,
+        "canDeal": viewer_id == row["host_id"] and state["stage"] == "waiting"
+                   and len(state["players"]) >= poker.MIN_PLAYERS,
+        "result": state["result"],
+    }
+
+
+def post_info_card(req, channel_id, payload):
+    """Persist a Gamesman info card and post it as a bot message.
+
+    Reusing the games row keeps the card in channel history, the way a real
+    bot embed stays where it was posted.
+    """
+    now = db.now()
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO games (channel_id, mode, status, host_id, state, bet,"
+            " settled, created_at, updated_at) VALUES (?,?,?,?,?,0,1,?,?)",
+            (channel_id, "info", "finished", req.user["id"], json.dumps(payload),
+             now, now),
+        )
+    msg_id = post_game_message(req, channel_id, cur.lastrowid)
+    mark_read(req.conn, req.user["id"], channel_id, msg_id)
+    return {"message": serialize_one(req.conn, msg_id, req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
+
+
+@route("POST", r"/api/channels/(\d+)/gamesman")
+def api_gamesman_card(req, channel_id):
+    """The Gamesman answers /claim, /balance, /bank and /leaderboard in-channel."""
+    req.require_auth()
+    channel_id = int(channel_id)
+    ch = channel_access_or_403(req, channel_id)
+    kind = (req.body.get("kind") or "").lower()
+
+    if kind == "claim":
+        result = api_claim(req)
+        me = req.conn.execute(
+            "SELECT * FROM users WHERE id = ?", (req.user["id"],)
+        ).fetchone()
+        return post_info_card(req, channel_id, {
+            "kind": "claim",
+            "player": db.public_user(me, True),
+            "claimed": result["claimed"],
+            "coins": result["coins"],
+            "stats": result["stats"],
+        })
+
+    if kind == "balance":
+        w = wallet_payload(req.conn, req.user["id"])
+        me = req.conn.execute(
+            "SELECT * FROM users WHERE id = ?", (req.user["id"],)
+        ).fetchone()
+        return post_info_card(req, channel_id, {
+            "kind": "balance",
+            "player": db.public_user(me, True),
+            "coins": w["coins"],
+            "canClaim": w["canClaim"],
+            "claimIn": w["claimIn"],
+            "stats": w["stats"],
+        })
+
+    if kind in ("bank", "leaderboard"):
+        if ch["kind"] != "text":
+            raise HttpError(400, f"/{kind} needs a server channel.")
+        data = (api_bank(req, ch["guild_id"]) if kind == "bank"
+                else api_leaderboard(req, ch["guild_id"]))
+        return post_info_card(req, channel_id, {"kind": kind, **data})
+
+    raise HttpError(400, "Unknown Gamesman card.")
+
+
+@route("POST", r"/api/channels/(\d+)/poker")
+def api_start_poker(req, channel_id):
+    """Open a poker table. Everyone antes the same amount to sit down."""
+    req.require_auth()
+    channel_id = int(channel_id)
+    ch = channel_access_or_403(req, channel_id)
+    if ch["kind"] == "dm":
+        raise HttpError(400, "Poker needs a server channel so others can join.")
+
+    ante = take_bet(req, req.body.get("bet"))
+    if ante < 10:
+        if ante:
+            with req.conn:
+                db.adjust_coins(req.conn, req.user["id"], ante)
+        raise HttpError(400, "The minimum ante is 10 Sana Coin.")
+
+    state = poker.new_table(req.user["id"], ante)
+    state["pot"] = ante
+    state["players"][0]["contributed"] = ante
+
+    # "vs cpu" seats house players and starts straight away.
+    bots = req.body.get("bots")
+    bots = max(0, min(int(bots), poker.MAX_PLAYERS - 1)) if bots else 0
+    status = "waiting"
+    for _ in range(bots):
+        poker.add_cpu(state)
+    if bots:
+        poker.deal(state)
+        poker.play_cpus(state)
+        status = "finished" if state["stage"] == "showdown" else "playing"
+
+    now = db.now()
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO games (channel_id, mode, status, host_id, state, bet,"
+            " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (channel_id, "poker", status, req.user["id"], json.dumps(state),
+             ante, now, now),
+        )
+    if status == "finished":
+        row = req.conn.execute("SELECT * FROM games WHERE id = ?", (cur.lastrowid,)).fetchone()
+        settle_poker(req.conn, row, state)
+    msg_id = post_game_message(req, channel_id, cur.lastrowid)
+    mark_read(req.conn, req.user["id"], channel_id, msg_id)
+    return {"message": serialize_one(req.conn, msg_id, req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
+
+
+@route("POST", r"/api/games/(\d+)/poker/join")
+def api_poker_join(req, game_id):
+    req.require_auth()
+    row = load_game(req, game_id)
+    if row["mode"] != "poker":
+        raise HttpError(400, "That isn't a poker table.")
+    state = json.loads(row["state"])
+    if state["stage"] != "waiting":
+        raise HttpError(409, "That hand has already started.")
+    if poker.seat(state, req.user["id"]):
+        raise HttpError(409, "You're already at that table.")
+    if len(state["players"]) >= poker.MAX_PLAYERS:
+        raise HttpError(409, f"That table is full ({poker.MAX_PLAYERS} players).")
+
+    ante = state["ante"]
+    if db.balance(req.conn, req.user["id"]) < ante:
+        raise HttpError(400, f"The ante is {ante:,} Sana Coin and you can't cover it.")
+
+    player = poker.new_player(req.user["id"])
+    player["contributed"] = ante
+    state["players"].append(player)
+    state["pot"] += ante
+    with req.conn:
+        db.adjust_coins(req.conn, req.user["id"], -ante)
+    return save_poker(req, row, state, "waiting")
+
+
+def save_poker(req, row, state, status):
+    with req.conn:
+        req.conn.execute(
+            "UPDATE games SET state = ?, status = ?, version = version + 1,"
+            " updated_at = ? WHERE id = ?",
+            (json.dumps(state), status, db.now(), row["id"]),
+        )
+    if status == "finished":
+        settle_poker(req.conn, row, state)
+    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
+
+
+def settle_poker(conn, row, state):
+    """Pay the pot out once, and record everyone's result."""
+    fresh = conn.execute("SELECT settled FROM games WHERE id = ?", (row["id"],)).fetchone()
+    if fresh["settled"]:
+        return
+    result = state["result"]
+    winners = set(result["winners"])
+    share = result["share"]
+    with conn:
+        conn.execute("UPDATE games SET settled = 1 WHERE id = ?", (row["id"],))
+        for p in state["players"]:
+            # House players have no wallet and don't appear on the leaderboard.
+            if p.get("cpu"):
+                continue
+            uid, staked = p["userId"], p["contributed"]
+            if uid in winners:
+                db.adjust_coins(conn, uid, share)
+                db.record_result(conn, uid, "win", share - staked, staked)
+            else:
+                db.record_result(conn, uid, "lose", -staked, staked)
+
+
+@route("POST", r"/api/games/(\d+)/poker/deal")
+def api_poker_deal(req, game_id):
+    req.require_auth()
+    row = load_game(req, game_id)
+    if row["mode"] != "poker":
+        raise HttpError(400, "That isn't a poker table.")
+    if row["host_id"] != req.user["id"]:
+        raise HttpError(403, "Only the player who opened the table can deal.")
+    state = json.loads(row["state"])
+    if state["stage"] != "waiting":
+        raise HttpError(409, "The cards are already out.")
+    if len(state["players"]) < poker.MIN_PLAYERS:
+        raise HttpError(400, "You need at least one other player.")
+    poker.deal(state)
+    return save_poker(req, row, state, "playing")
+
+
+@route("POST", r"/api/games/(\d+)/poker/action")
+def api_poker_action(req, game_id):
+    req.require_auth()
+    row = load_game(req, game_id)
+    if row["mode"] != "poker":
+        raise HttpError(400, "That isn't a poker table.")
+    action = (req.body.get("action") or "").lower()
+    if action not in ("stay", "fold"):
+        raise HttpError(400, "Action must be 'stay' or 'fold'.")
+
+    state = json.loads(row["state"])
+    me = poker.seat(state, req.user["id"])
+    if not me:
+        raise HttpError(403, "You're not at that table.")
+    if state["stage"] in ("waiting", "showdown"):
+        raise HttpError(409, "There's nothing to act on.")
+    if me["folded"] or me["acted"]:
+        raise HttpError(409, "You've already acted this round.")
+
+    if action == "stay":
+        if db.balance(req.conn, req.user["id"]) < state["ante"]:
+            raise HttpError(400, "You can't cover the next round — fold instead.")
+        with req.conn:
+            db.adjust_coins(req.conn, req.user["id"], -state["ante"])
+        poker.stay(state, req.user["id"])
+    else:
+        poker.fold(state, req.user["id"])
+
+    if poker.hand_over(state) or poker.round_complete(state):
+        poker.advance(state)
+    poker.play_cpus(state)
+
+    status = "finished" if state["stage"] == "showdown" else "playing"
+    return save_poker(req, row, state, status)
 
 
 @route("POST", r"/api/channels/(\d+)/slots")

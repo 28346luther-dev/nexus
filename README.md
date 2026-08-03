@@ -130,6 +130,31 @@ platform's health check at it.
 | `HOST`          | `0.0.0.0`            | Interface to bind.                                |
 | `NEXUS_DB`      | `./data.db`          | Database location. Point at your volume in prod.  |
 | `NEXUS_UPLOADS` | next to `NEXUS_DB`   | Where uploaded images are written.                |
+| `GIPHY_API_KEY` | unset                | Enables `/gif`. Without it the picker says so.    |
+
+### Turning on GIFs
+
+Get a free key at [developers.giphy.com](https://developers.giphy.com), then in
+Railway add a variable:
+
+| Variable        | Value            |
+|-----------------|------------------|
+| `GIPHY_API_KEY` | your key         |
+
+The key stays on the server — the browser only ever talks to `/api/gifs`, which
+proxies Giphy and passes back just the fields the picker needs. Never put it in
+the repo or in client code.
+
+To use `/gif` locally, export it first:
+
+```bash
+export GIPHY_API_KEY=your-key-here
+```
+
+**macOS note:** python.org builds ship without a CA bundle, so HTTPS calls to
+Giphy fail with a certificate error. Run the `Install Certificates.command`
+inside `/Applications/Python 3.x/`, or start the server with
+`SSL_CERT_FILE=/etc/ssl/cert.pem`. Linux hosts like Railway are unaffected.
 
 Uploads default to an `uploads/` folder beside the database, so setting
 `NEXUS_DB=/data/nexus.db` puts images on the same Railway volume automatically —
@@ -156,20 +181,43 @@ or cancelled; if two people request each other, it auto-accepts.
 
 **Direct messages** — one-to-one conversations with unread badges.
 
-**Gamesman (blackjack bot)** — a bot account that joins every server
-automatically, including ones created before it existed. Start a hand from the
-message box:
+**Gamesman (games and Sana Coin)** — a bot account that joins every server
+automatically, including ones created before it existed. Everything it does is
+driven by slash commands and answered as a card in the channel. Type `/` to see
+the list, arrows to choose, Enter to run.
 
 | Command | What it does |
 |---|---|
-| `/blackjack cpu` | Play against the dealer — hits to 17, hole card stays down until you stand |
-| `/blackjack 1v1` | Post an open table; anyone else in the server can hit **Join game** |
+| `/blackjack cpu [bet]` | Against the dealer, which hits to 17. Blackjack pays 3:2 |
+| `/blackjack 1v1 [bet]` | Open a table; anyone in the server can **Join** by matching the stake |
+| `/poker cpu [bet]` | Simplified Hold'em against three house players |
+| `/poker table [bet]` | Open a Hold'em table for up to 8 people |
+| `/slots <bet>` | Three weighted reels |
+| `/claim` | Collect 1,000 Sana Coin, once every 24 hours |
+| `/balance` | Your coins, rank and record |
+| `/bank` | Everyone's balances in this server |
+| `/leaderboard` | Top players by games won |
 
-Type `/` to see the list, arrows to choose, Enter to run. You can also click
-Gamesman in the member list. In a 1v1 the opponent's cards stay face down until
-someone actually joins, so nobody can peek at the hand before deciding. Ace
-counts as 11 or 1, closest to 21 without busting wins, and equal totals push.
-`/blackjack 1v1` needs a server channel; `cpu` works in DMs too.
+Leave the bet off and you get a **"How much would you like to bet?"** dialog
+with quick amounts, All in, and a For fun option.
+
+**Sana Coin** — everyone starts with 2,000. Stakes are held out of your balance
+when a hand starts and paid out exactly once. Ranks (Rookie → Chancer →
+Hustler → Sharp → High Roller → Sana Legend) come from **wins, not balance**,
+so they can't simply be bought.
+
+**Card secrecy.** In 1v1 blackjack you see only your own cards until the hand
+settles, and spectators see neither — showing both would let whoever acts
+second read the total they need. Poker hole cards work the same way. The
+dealer's hole card in the CPU game stays down until you stand.
+
+**Simplified Hold'em** means no raising: each street costs a fixed amount to
+stay in, so every decision is just *stay* or *fold*. Ante to sit, then the
+flop, turn and river each cost the same again. Best five cards of your seven
+wins; ties split the pot.
+
+**GIFs** — `/gif <search>` opens a Giphy picker. Tap ★ on any GIF to keep it,
+and the **Favourites** tab holds up to 100. Requires `GIPHY_API_KEY` (below).
 
 **Replies** — hover a message and hit ↩. The composer shows who you're
 answering (Escape cancels), and the sent reply carries a preview of the
@@ -231,6 +279,9 @@ WebSockets and moving from SQLite to Postgres.
 | `app.py`           | HTTP server, routing, all API endpoints        |
 | `db.py`            | Schema, migrations, password hashing           |
 | `blackjack.py`     | Card and hand rules for the Gamesman bot       |
+| `poker.py`         | Hold'em rules and hand ranking                 |
+| `slots.py`         | Slot reels and payout table                    |
+| `tests/`           | Plain-Python API tests; see tests/README.md    |
 | `images.py`        | Image sniffing and size checks for uploads     |
 | `static/index.html`| Page shell                                     |
 | `static/app.js`    | Entire client — vanilla JS, no build step      |
