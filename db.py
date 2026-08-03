@@ -399,6 +399,21 @@ def migrate(conn):
         )
         conn.execute("ALTER TABLE users ADD COLUMN last_claim INTEGER NOT NULL DEFAULT 0")
 
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)")}
+    if "position" not in have:
+        conn.execute("ALTER TABLE channels ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
+        # Seed the order from the existing ids so nothing appears to move.
+        conn.execute(
+            "UPDATE channels SET position = ("
+            "  SELECT COUNT(*) FROM channels c2"
+            "  WHERE c2.guild_id = channels.guild_id AND c2.id < channels.id)"
+        )
+
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(guilds)")}
+    if "icon" not in have:
+        # Stored upload name, or NULL to fall back to the coloured initials.
+        conn.execute("ALTER TABLE guilds ADD COLUMN icon TEXT")
+
     have = {r["name"] for r in conn.execute("PRAGMA table_info(games)")}
     if "bet" not in have:
         conn.execute("ALTER TABLE games ADD COLUMN bet INTEGER NOT NULL DEFAULT 0")

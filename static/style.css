@@ -140,6 +140,19 @@ button { background:none; border:0; cursor:pointer; }
 .rail-btn.add, .rail-btn.join { color:var(--green); font-size:24px; }
 .rail-btn.add:hover, .rail-btn.join:hover { background:var(--green); color:#fff; }
 .rail-btn.guild { font-size:16px; letter-spacing:-.5px; }
+/* Absolutely positioned so the icon fills the button regardless of how the
+   button's own height is resolved. */
+.rail-icon {
+  position:absolute; top:0; left:0; width:100%; height:100%;
+  object-fit:cover; display:block;
+}
+/* Matches the rail's rounded square. Needs .avatar in the selector to outrank
+   the plain .avatar circle, which is defined later in the file. */
+.avatar.server-icon-preview { border-radius:18px; overflow:hidden; }
+.avatar.server-icon-preview img {
+  position:absolute; top:0; left:0; width:100%; height:100%;
+  object-fit:cover; border-radius:18px;
+}
 .rail-btn.active::before, .rail-btn.pinged::before {
   content:""; position:absolute; left:-16px; width:8px; border-radius:0 4px 4px 0;
   background:#fff; height:40px;
@@ -188,6 +201,9 @@ button { background:none; border:0; cursor:pointer; }
   min-width:18px; height:18px; border-radius:9px; padding:0 5px;
   display:grid; place-items:center; flex:none;
 }
+.side-item.draggable { cursor:grab; }
+.side-item.draggable:active { cursor:grabbing; }
+.side-item.dragging { opacity:.4; background:var(--bg-4); }
 .side-item .x { opacity:0; color:var(--text-mute); font-size:16px; }
 .side-item:hover .x { opacity:1; }
 .side-item .x:hover { color:var(--text); }
@@ -828,6 +844,10 @@ button { background:none; border:0; cursor:pointer; }
 }
 .composer-btn:hover { color:var(--text); }
 .composer-btn.attach { position:absolute; left:4px; bottom:5px; }
+.composer-btn.gif-btn {
+  width:auto; padding:0 7px; font-size:11px; font-weight:800; letter-spacing:.5px;
+  border:1.5px solid currentColor; border-radius:5px; height:22px; align-self:center;
+}
 .composer-tools {
   position:absolute; right:4px; bottom:5px; display:flex; gap:2px;
 }

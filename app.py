@@ -617,7 +617,8 @@ def api_guilds(req):
     ).fetchall()
     for g in rows:
         channels = req.conn.execute(
-            "SELECT * FROM channels WHERE guild_id = ? AND kind = 'text' ORDER BY id",
+            "SELECT * FROM channels WHERE guild_id = ? AND kind = 'text'"
+            " ORDER BY position, id",
             (g["id"],),
         ).fetchall()
         guilds.append(
@@ -625,6 +626,7 @@ def api_guilds(req):
                 "id": g["id"],
                 "name": g["name"],
                 "color": g["color"],
+                "iconUrl": f"/uploads/{g['icon']}" if g["icon"] else None,
                 "ownerId": g["owner_id"],
                 "isOwner": g["owner_id"] == uid,
                 "memberCount": req.conn.execute(
@@ -727,12 +729,83 @@ def api_create_channel(req, guild_id):
     name = re.sub(r"[^a-z0-9\-_]", "", name)
     if not name:
         raise HttpError(400, "Channel names need at least one letter or number.")
+    # Land at the bottom of the list rather than wherever position 0 sorts.
+    last = req.conn.execute(
+        "SELECT COALESCE(MAX(position), -1) p FROM channels WHERE guild_id = ?",
+        (guild_id,),
+    ).fetchone()["p"]
     with req.conn:
         cur = req.conn.execute(
-            "INSERT INTO channels (guild_id, kind, name, created_at) VALUES (?,'text',?,?)",
-            (guild_id, name, db.now()),
+            "INSERT INTO channels (guild_id, kind, name, position, created_at)"
+            " VALUES (?,'text',?,?,?)",
+            (guild_id, name, last + 1, db.now()),
         )
     return {"channelId": cur.lastrowid}
+
+
+@route("PATCH", r"/api/guilds/(\d+)/channels/order")
+def api_reorder_channels(req, guild_id):
+    """Rewrite channel order from a list of ids, owner only."""
+    req.require_auth()
+    guild_id = int(guild_id)
+    owner_only(req, guild_id)
+
+    wanted = req.body.get("order")
+    if not isinstance(wanted, list) or not wanted:
+        raise HttpError(400, "Send the channel ids in their new order.")
+
+    mine = [
+        r["id"]
+        for r in req.conn.execute(
+            "SELECT id FROM channels WHERE guild_id = ? AND kind = 'text'", (guild_id,)
+        )
+    ]
+    try:
+        wanted = [int(c) for c in wanted]
+    except (TypeError, ValueError):
+        raise HttpError(400, "Channel ids must be numbers.")
+    # Must be exactly this server's channels — no additions, no omissions.
+    if sorted(wanted) != sorted(mine):
+        raise HttpError(400, "That list doesn't match this server's channels.")
+
+    with req.conn:
+        for index, channel_id in enumerate(wanted):
+            req.conn.execute(
+                "UPDATE channels SET position = ? WHERE id = ? AND guild_id = ?",
+                (index, channel_id, guild_id),
+            )
+    return {"ok": True}
+
+
+@route("POST", r"/api/guilds/(\d+)/icon", raw=images.MAX_AVATAR)
+def api_set_guild_icon(req, guild_id):
+    req.require_auth()
+    guild_id = int(guild_id)
+    owner_only(req, guild_id)
+    data, kind = read_image_or_400(req, images.MAX_AVATAR)
+    stored = store_upload(data, kind)
+
+    previous = req.conn.execute(
+        "SELECT icon FROM guilds WHERE id = ?", (guild_id,)
+    ).fetchone()["icon"]
+    with req.conn:
+        req.conn.execute("UPDATE guilds SET icon = ? WHERE id = ?", (stored, guild_id))
+    discard_upload(previous)
+    return {"iconUrl": f"/uploads/{stored}"}
+
+
+@route("DELETE", r"/api/guilds/(\d+)/icon")
+def api_clear_guild_icon(req, guild_id):
+    req.require_auth()
+    guild_id = int(guild_id)
+    owner_only(req, guild_id)
+    previous = req.conn.execute(
+        "SELECT icon FROM guilds WHERE id = ?", (guild_id,)
+    ).fetchone()["icon"]
+    with req.conn:
+        req.conn.execute("UPDATE guilds SET icon = NULL WHERE id = ?", (guild_id,))
+    discard_upload(previous)
+    return {"iconUrl": None}
 
 
 @route("DELETE", r"/api/channels/(\d+)")
@@ -1086,6 +1159,7 @@ def api_preview_invite(req, code):
             "id": guild["id"],
             "name": guild["name"],
             "color": guild["color"],
+            "iconUrl": f"/uploads/{guild['icon']}" if guild["icon"] else None,
             "memberCount": req.conn.execute(
                 "SELECT COUNT(*) c FROM guild_members WHERE guild_id = ?", (guild["id"],)
             ).fetchone()["c"],
@@ -1126,7 +1200,8 @@ def api_join_invite(req, code):
                 "UPDATE invites SET uses = uses + 1 WHERE code = ?", (code,)
             )
     first = req.conn.execute(
-        "SELECT id FROM channels WHERE guild_id = ? AND kind = 'text' ORDER BY id LIMIT 1",
+        "SELECT id FROM channels WHERE guild_id = ? AND kind = 'text'"
+        " ORDER BY position, id LIMIT 1",
         (guild["id"],),
     ).fetchone()
     return {

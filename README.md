@@ -169,8 +169,11 @@ with 200,000 iterations and a per-user salt. Sessions are HttpOnly cookies with
 a sliding 30-day expiry.
 
 **Servers and channels** — anyone can create a server; it starts with `#general`
-and `#random`. The owner can add and delete channels, rename the server, remove
-members, and delete messages. Members can leave.
+and `#random`. The owner can add and delete channels, **drag channels in the
+sidebar to reorder them**, set a **server icon** (*Server options → Change
+server icon*, PNG/JPEG/GIF/WebP up to 2 MB), rename the server, remove members,
+and delete messages. Members can leave. New channels are added at the bottom of
+the list, and the order is shared with everyone in the server.
 
 **Invite codes** — 8-character codes, optionally limited by number of uses or an
 expiry. Share the bare code or a full `/invite/<code>` link. Codes can be
@@ -216,7 +219,8 @@ stay in, so every decision is just *stay* or *fold*. Ante to sit, then the
 flop, turn and river each cost the same again. Best five cards of your seven
 wins; ties split the pot.
 
-**GIFs** — `/gif <search>` opens a Giphy picker. Tap ★ on any GIF to keep it,
+**GIFs** — the **GIF** button in the message bar, or `/gif <search>`, opens a
+Giphy picker. Tap ★ on any GIF to keep it,
 and the **Favourites** tab holds up to 100. Requires `GIPHY_API_KEY` (below).
 
 **Replies** — hover a message and hit ↩. The composer shows who you're

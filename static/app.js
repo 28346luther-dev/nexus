@@ -237,6 +237,10 @@ $('#auth-form').onsubmit = async (e) => {
 
 // ------------------------------------------------------------------ render: rail
 
+function guildInitials(name) {
+  return name.split(/\s+/).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
+}
+
 function renderRail() {
   const list = $('#rail-guilds');
   list.replaceChildren();
@@ -253,8 +257,16 @@ function renderRail() {
   state.guilds.forEach((g) => {
     const btn = el('button', 'rail-btn guild');
     btn.title = g.name;
-    btn.style.background = state.activeGuildId === g.id ? g.color : 'var(--bg-3)';
-    btn.textContent = g.name.split(/\s+/).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
+    if (g.iconUrl) {
+      const img = el('img', 'rail-icon');
+      img.src = g.iconUrl;
+      img.alt = '';
+      btn.appendChild(img);
+      btn.style.background = 'var(--bg-3)';
+    } else {
+      btn.style.background = state.activeGuildId === g.id ? g.color : 'var(--bg-3)';
+      btn.textContent = guildInitials(g.name);
+    }
     btn.classList.toggle('active', state.activeGuildId === g.id);
     const unread = g.channels.reduce((n, c) => n + c.unread, 0);
     const pings = g.channels.reduce((n, c) => n + (c.mentions || 0), 0);
@@ -267,10 +279,12 @@ function renderRail() {
       btn.appendChild(el('span', 'rail-badge', unread > 99 ? '99+' : String(unread)));
       if (state.activeGuildId !== g.id) btn.classList.add('pinged');
     }
-    btn.onmouseenter = () => { btn.style.background = g.color; };
-    btn.onmouseleave = () => {
-      if (state.activeGuildId !== g.id) btn.style.background = 'var(--bg-3)';
-    };
+    if (!g.iconUrl) {
+      btn.onmouseenter = () => { btn.style.background = g.color; };
+      btn.onmouseleave = () => {
+        if (state.activeGuildId !== g.id) btn.style.background = 'var(--bg-3)';
+      };
+    }
     btn.onclick = () => openGuild(g.id);
     list.appendChild(btn);
   });
@@ -299,6 +313,12 @@ function renderSidebar() {
 
     guild.channels.forEach((c) => {
       const item = el('button', 'side-item');
+      item.dataset.channelId = String(c.id);
+      if (guild.isOwner) {
+        item.draggable = true;
+        item.classList.add('draggable');
+        item.title = 'Drag to reorder';
+      }
       item.classList.toggle('active', c.id === state.activeChannelId);
       if (c.unread > 0) item.classList.add('unread');
       item.appendChild(el('span', 'hash', '#'));
@@ -328,6 +348,7 @@ function renderSidebar() {
       }
       body.appendChild(item);
     });
+    if (guild.isOwner) enableChannelDrag(body, guild);
     return;
   }
 
@@ -372,6 +393,81 @@ function renderSidebar() {
     item.onclick = () => openChannel(d.channelId);
     body.appendChild(item);
   });
+}
+
+/** Let the owner drag channels into a new order in the sidebar. */
+function enableChannelDrag(container, guild) {
+  let dragging = null;
+
+  const items = () => [...container.querySelectorAll('.side-item.draggable')];
+
+  container.querySelectorAll('.side-item.draggable').forEach((item) => {
+    item.addEventListener('dragstart', (e) => {
+      dragging = item;
+      item.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      // Firefox refuses to start a drag unless some data is set.
+      e.dataTransfer.setData('text/plain', item.dataset.channelId);
+    });
+
+    item.addEventListener('dragend', async () => {
+      item.classList.remove('dragging');
+      if (!dragging) return;
+      dragging = null;
+
+      // Re-read the guild from state: a background refresh may have replaced
+      // the object captured when this row was rendered, and comparing against
+      // that stale copy would send the wrong order.
+      const live = state.guilds.find((g) => g.id === guild.id);
+      if (!live) return;
+
+      const order = items().map((n) => Number(n.dataset.channelId));
+      const current = live.channels.map((c) => c.id);
+      if (order.join() === current.join()) return;      // nothing moved
+
+      // Show the new order straight away; put it back if the server refuses.
+      const byId = new Map(live.channels.map((c) => [c.id, c]));
+      if (order.some((id) => !byId.has(id))) return;    // list moved on
+      live.channels = order.map((id) => byId.get(id));
+      try {
+        await api('PATCH', `/api/guilds/${live.id}/channels/order`, { order });
+      } catch (err) {
+        toast(err.message, 'error');
+        live.channels = current.map((id) => byId.get(id));
+        renderSidebar();
+      }
+    });
+  });
+
+  // The sidebar element outlives each render — only its children are replaced —
+  // so these must be attached once or they pile up on every redraw.
+  if (!container.dataset.dragWired) {
+    container.dataset.dragWired = '1';
+    container.addEventListener('dragover', (e) => {
+      const held = container.querySelector('.side-item.dragging');
+      if (!held) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const after = dropTargetFor(container, held, e.clientY);
+      if (after === null) container.appendChild(held);
+      else container.insertBefore(held, after);
+    });
+    container.addEventListener('drop', (e) => {
+      if (container.querySelector('.side-item.dragging')) e.preventDefault();
+    });
+  }
+
+}
+
+/** The item the dragged one should sit before, or null for the end. */
+function dropTargetFor(container, held, y) {
+  const others = [...container.querySelectorAll('.side-item.draggable')]
+    .filter((n) => n !== held);
+  for (const node of others) {
+    const rect = node.getBoundingClientRect();
+    if (y < rect.top + rect.height / 2) return node;
+  }
+  return null;
 }
 
 // ------------------------------------------------------------------ render: members
@@ -2248,6 +2344,7 @@ $('#emoji-btn').onclick = (e) => {
   });
 };
 
+$('#gif-btn').onclick = () => openGifPicker('');
 $('#sticker-btn').onclick = (e) => openStickerPicker(e.currentTarget);
 
 async function stickerSource() {
@@ -2564,6 +2661,10 @@ $('#guild-menu-btn').onclick = () => {
       stick.onclick = () => { close(); manageStickers(guild.id); };
       stack.appendChild(stick);
 
+      const icon = el('button', 'btn', 'Change server icon');
+      icon.onclick = () => { close(); promptServerIcon(guild); };
+      stack.appendChild(icon);
+
       const rename = el('button', 'btn', 'Rename server');
       rename.onclick = () => { close(); promptRename(guild); };
       stack.appendChild(rename);
@@ -2602,6 +2703,101 @@ $('#guild-menu-btn').onclick = () => {
     box.appendChild(stack);
   });
 };
+
+function promptServerIcon(guild) {
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Server icon'));
+    box.appendChild(el('p', 'sub',
+      'PNG, JPEG, GIF or WebP up to 2 MB. Square images look best.'));
+
+    const row = el('div', 'pic-row');
+    let preview = serverIconPreview(guild);
+    row.appendChild(preview);
+
+    const buttons = el('div', 'pic-buttons');
+    const file = el('input');
+    file.type = 'file';
+    file.accept = 'image/png,image/jpeg,image/gif,image/webp';
+    file.hidden = true;
+    const upload = el('button', 'btn small', 'Upload image');
+    upload.type = 'button';
+    upload.onclick = () => file.click();
+    buttons.append(upload, file);
+
+    const remove = el('button', 'btn small ghost', 'Remove');
+    remove.type = 'button';
+    remove.hidden = !guild.iconUrl;
+    buttons.appendChild(remove);
+
+    const status = el('small', 'muted');
+    buttons.appendChild(status);
+    row.appendChild(buttons);
+    box.appendChild(row);
+
+    const refresh = () => {
+      const fresh = serverIconPreview(guild);
+      preview.replaceWith(fresh);
+      preview = fresh;
+      remove.hidden = !guild.iconUrl;
+      renderRail();
+    };
+
+    file.onchange = async () => {
+      const chosen = file.files[0];
+      file.value = '';
+      if (!chosen) return;
+      if (chosen.size > 2 * 1024 * 1024) {
+        status.textContent = `That image is ${formatBytes(chosen.size)} — the limit is 2 MB.`;
+        return;
+      }
+      status.textContent = 'Uploading…';
+      try {
+        const res = await fetch(`/api/guilds/${guild.id}/icon`, {
+          method: 'POST', body: chosen, credentials: 'same-origin',
+          headers: { 'Content-Type': chosen.type },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+        guild.iconUrl = data.iconUrl;
+        status.textContent = '';
+        refresh();
+        await refreshSidebarData();
+        renderRail();
+        toast('Server icon updated.', 'ok');
+      } catch (err) { status.textContent = err.message; }
+    };
+
+    remove.onclick = async () => {
+      try {
+        await api('DELETE', `/api/guilds/${guild.id}/icon`);
+        guild.iconUrl = null;
+        refresh();
+        await refreshSidebarData();
+        renderRail();
+      } catch (err) { toast(err.message, 'error'); }
+    };
+
+    const done = el('div', 'modal-actions');
+    const ok = el('button', 'btn primary', 'Done');
+    ok.onclick = close;
+    done.appendChild(ok);
+    box.appendChild(done);
+  });
+}
+
+function serverIconPreview(guild) {
+  const node = el('div', 'avatar xl server-icon-preview');
+  if (guild.iconUrl) {
+    const img = el('img');
+    img.src = guild.iconUrl;
+    img.alt = '';
+    node.appendChild(img);
+  } else {
+    node.textContent = guildInitials(guild.name);
+    node.style.background = guild.color;
+  }
+  return node;
+}
 
 function promptRename(guild) {
   openModal((box, close) => {
