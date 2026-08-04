@@ -53,8 +53,8 @@ check("starting rank", w["stats"]["rank"] == "Rookie", w["stats"])
 check("claim available immediately", w["canClaim"] is True, w)
 
 s, r = host.call("POST", "/api/wallet/claim")
-check("claim pays the daily amount", s == 200 and r["claimed"] == 1000, r)
-check("balance went up", r["coins"] == 3000, r["coins"])
+check("claim pays the daily amount", s == 200 and r["claimed"] == 5000, r)
+check("balance went up", r["coins"] == 7000, r["coins"])
 s, r = host.call("POST", "/api/wallet/claim")
 check("second claim same day refused", s == 429, (s, r))
 _, w = host.call("GET", "/api/wallet")
@@ -68,7 +68,7 @@ check("negative bet rejected", s == 400, (s, r))
 s, r = host.call("POST", f"/api/channels/{cid}/games", {"mode": "cpu", "bet": 50_000})
 check("bet beyond your balance rejected", s == 400, (s, r))
 _, w = host.call("GET", "/api/wallet")
-check("failed bets don't move the balance", w["coins"] == 3000, w["coins"])
+check("failed bets don't move the balance", w["coins"] == 7000, w["coins"])
 
 before = w["coins"]
 s, r = host.call("POST", f"/api/channels/{cid}/games", {"mode": "cpu", "bet": 500})
@@ -176,7 +176,7 @@ check("bank sorted richest first",
       [a["coins"] for a in r["accounts"]] == sorted([a["coins"] for a in r["accounts"]], reverse=True),
       [a["coins"] for a in r["accounts"]])
 check("bot excluded from the bank",
-      all(a["username"] != "Gamesman" for a in r["accounts"]), r["accounts"])
+      all(a["username"] != "Frontman" for a in r["accounts"]), r["accounts"])
 check("bank reports a total", r["total"] == sum(a["coins"] for a in r["accounts"]), r["total"])
 
 s, r = C().call("GET", f"/api/guilds/{gid}/bank")

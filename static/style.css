@@ -204,6 +204,16 @@ button { background:none; border:0; cursor:pointer; }
 .side-item.draggable { cursor:grab; }
 .side-item.draggable:active { cursor:grabbing; }
 .side-item.dragging { opacity:.4; background:var(--bg-4); }
+/* Sits in the row like the delete ×, and appears on hover the same way. A
+   muted channel keeps its bell showing so the state is readable at a glance. */
+.side-item .mute-btn {
+  opacity:0; font-size:12px; line-height:1; flex:none; filter:grayscale(1);
+}
+.side-item:hover .mute-btn, .side-item .mute-btn.on { opacity:.55; }
+.side-item .mute-btn:hover { opacity:1; }
+.side-item.muted { opacity:.45; }
+.side-item.muted:hover { opacity:.7; }
+
 .side-item .x { opacity:0; color:var(--text-mute); font-size:16px; }
 .side-item:hover .x { opacity:1; }
 .side-item .x:hover { color:var(--text); }
@@ -649,11 +659,172 @@ button { background:none; border:0; cursor:pointer; }
 .poker-hole .card-mid { font-size:15px; }
 .poker-hand-name { font-size:11.5px; color:var(--text-mute); margin-left:auto; }
 .seat-flag.win-flag { color:#8ce0a8; border-color:#2f6b45; }
+/* What a seat has put in this street, so a raise is visible round the table. */
+.poker-chips {
+  font-size:11.5px; font-weight:650; color:var(--yellow); margin-left:auto;
+  flex:none;
+}
+.poker-hand-name + .poker-chips, .poker-chips + .poker-hand-name { margin-left:8px; }
+
+/* ------------------------------------------------------- split blackjack */
+.split-hand {
+  border-left:2px solid var(--line); padding:4px 0 4px 10px; margin-bottom:8px;
+}
+.split-hand.active { border-left-color:var(--accent); }
+.split-head { display:flex; align-items:center; gap:7px; margin-bottom:6px; }
+.split-label {
+  font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
+  color:var(--text-mute);
+}
+.split-hand.active .split-label { color:var(--text); }
+.split-stake { font-size:11.5px; color:var(--text-mute); margin-left:auto; }
+.split-outcome {
+  font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
+}
+.split-outcome.host { color:#8ce0a8; }
+.split-outcome.opp { color:#ffa9ab; }
+.split-outcome.push { color:var(--text-dim); }
+
+/* ------------------------------------------------------------- roulette */
+.game-card.roulette { border-left-color:#c0392b; }
+.wheel { display:grid; place-items:center; margin-bottom:12px; }
+.pocket {
+  width:96px; height:96px; border-radius:50%; display:grid; place-items:center;
+  align-content:center; gap:2px; border:4px solid rgba(255,255,255,.14);
+  box-shadow:0 6px 20px rgba(0,0,0,.45);
+}
+.pocket.red   { background:#b0242a; }
+.pocket.black { background:#1c1d21; }
+.pocket.green { background:#1f7a44; }
+.pocket-number { font-size:34px; font-weight:750; line-height:1; color:#fff; }
+.pocket-colour {
+  font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase;
+  color:rgba(255,255,255,.72);
+}
+
+.roulette-bets {
+  display:grid; grid-template-columns:repeat(3, 1fr); gap:6px; margin-bottom:16px;
+}
+.roulette-bet {
+  display:flex; flex-direction:column; gap:2px; align-items:flex-start;
+  background:var(--bg-0); border:1.5px solid transparent; border-radius:8px;
+  padding:8px 10px; text-align:left;
+}
+.roulette-bet:hover { border-color:var(--bg-4); }
+.roulette-bet.on { border-color:var(--accent); background:rgba(88,101,242,.16); }
+.roulette-bet.red { background:rgba(176,36,42,.28); }
+.roulette-bet.black { background:rgba(10,10,12,.55); }
+.rb-label { font-size:13.5px; font-weight:600; }
+.rb-pays { font-size:11px; color:var(--text-mute); }
 
 /* ------------------------------------------------------- gamesman cards */
 .game-card.info { border-left-color:var(--green); }
 .wallet-top { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
-.wallet-top strong { font-size:15px; }
+.wallet-top strong, .wallet-name { font-size:15px; font-weight:650; }
+
+/* --------------------------------------------------------------- the shop */
+.shop-list { display:flex; flex-direction:column; gap:8px; }
+.shop-item {
+  display:flex; align-items:center; gap:12px; background:var(--bg-0);
+  border:1px solid var(--line); border-radius:10px; padding:12px 14px;
+}
+.shop-item.owned { border-color:#2f6b45; background:rgba(59,165,93,.08); }
+.shop-icon {
+  width:38px; height:38px; flex:none; display:grid; place-items:center;
+  font-size:20px; background:var(--bg-2); border-radius:9px;
+}
+.shop-text { flex:1; min-width:0; }
+.shop-text strong { display:block; font-size:14.5px; }
+.shop-text .muted { font-size:13px; }
+.shop-detail { display:block; margin-top:3px; color:var(--text-mute); font-size:11.5px; }
+.shop-item .btn { flex:none; }
+
+/* ------------------------------------------------------------- shop perks */
+/* Kept to a text-shadow so it works over any name colour the user picked. */
+.name { display:inline-flex; align-items:baseline; gap:5px; min-width:0; }
+.name-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.name-text.glow {
+  text-shadow:0 0 6px currentColor, 0 0 14px currentColor;
+  animation:nameglow 2.6s ease-in-out infinite;
+}
+@keyframes nameglow {
+  50% { text-shadow:0 0 9px currentColor, 0 0 22px currentColor; }
+}
+.vip-tag {
+  background:linear-gradient(135deg, #f5c451, #c98a19); color:#241a03;
+  font-size:9.5px; font-weight:800; letter-spacing:.5px; padding:1px 4px;
+  border-radius:3px; flex:none; line-height:1.4;
+}
+/* A spinning conic gradient in a pseudo-element rather than on the avatar
+   itself, so the initial inside doesn't turn with it. The mask punches the
+   middle out, which is what makes it a ring rather than a disc covering the
+   face — and means it doesn't matter what paints above or below it. */
+.avatar.ringed::before {
+  content:""; position:absolute; inset:-3px; border-radius:50%;
+  background:conic-gradient(#ff5f6d, #ffc371, #47e5bc, #5865f2, #ff5f6d);
+  -webkit-mask:radial-gradient(closest-side, transparent calc(100% - 3px),
+                               #000 calc(100% - 3px));
+  mask:radial-gradient(closest-side, transparent calc(100% - 3px),
+                       #000 calc(100% - 3px));
+  animation:ringspin 4s linear infinite;
+}
+@keyframes ringspin { to { rotate:360deg; } }
+@media (prefers-reduced-motion:reduce) {
+  .avatar.ringed::before, .name-text.glow { animation:none; }
+}
+
+.m-name, .rank-name { font-size:14.5px; }
+.rank-name { display:flex; font-weight:650; }
+
+/* --------------------------------------------------------------- polls */
+.poll-card {
+  margin-top:6px; max-width:520px; background:var(--bg-1);
+  border-left:4px solid var(--yellow); border-radius:6px; padding:14px 16px;
+}
+.poll-card.closed { border-left-color:var(--text-mute); }
+.poll-card .game-title { color:#f8c57a; }
+.poll-card.closed .game-title { color:var(--text-dim); }
+.poll-question { font-size:16px; font-weight:650; margin-bottom:12px; line-height:1.35; }
+.poll-option {
+  position:relative; display:flex; align-items:center; gap:10px; width:100%;
+  text-align:left; background:var(--bg-0); border:1.5px solid transparent;
+  border-radius:8px; padding:9px 12px; margin-bottom:6px; overflow:hidden;
+}
+.poll-option:not(:disabled):hover { border-color:var(--bg-4); }
+.poll-option.mine { border-color:var(--accent); }
+.poll-option.leading .poll-fill { background:rgba(250,166,26,.22); }
+.poll-option:disabled { cursor:default; }
+/* The bar sits behind the label rather than beside it, so a long option never
+   squeezes the percentage off the end of the row. */
+.poll-fill {
+  position:absolute; left:0; top:0; bottom:0; background:rgba(88,101,242,.20);
+  transition:width .25s ease;
+}
+.poll-label { position:relative; flex:1; min-width:0; display:flex; gap:8px; }
+.poll-tick { width:12px; flex:none; color:var(--accent); font-weight:700; }
+.poll-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.poll-count {
+  position:relative; flex:none; font-size:12px; font-weight:650;
+  color:var(--text-dim);
+}
+.poll-foot {
+  display:flex; align-items:center; gap:10px; margin-top:10px;
+  padding-top:8px; border-top:1px solid var(--line);
+}
+.poll-foot .muted { flex:1; font-size:12px; }
+.poll-fields { display:flex; flex-direction:column; gap:8px; margin-bottom:12px; }
+.poll-field { display:flex; gap:6px; align-items:center; }
+.poll-field input {
+  flex:1; background:var(--bg-0); border:1px solid var(--line); border-radius:6px;
+  padding:10px 12px; outline:none;
+}
+.poll-field input:focus { border-color:var(--accent); }
+
+/* ------------------------------------------------------- who reacted */
+.reactor-pop { max-width:240px; }
+.reactor-list { display:flex; flex-direction:column; gap:6px; }
+.reactor { display:flex; align-items:center; gap:7px; font-size:13.5px; }
+.reactor-pop .muted { font-size:12px; }
 
 /* ----------------------------------------------------------------- gifs */
 .gif-tabs { margin:14px 0 12px; }

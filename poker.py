@@ -1,10 +1,9 @@
-"""Simplified Texas Hold'em for the Gamesman. Pure functions, no I/O.
+"""Texas Hold'em for the Gamesman. Pure functions, no I/O.
 
-Simplified means there is no raising: each betting round costs a fixed amount
-to stay in, so every decision is just "stay" or "fold". That keeps a table of
-six people moving without anyone needing to understand pot odds.
-
-Shape of a hand:
+Betting works the way it does at a real table. Each street opens with nothing
+to call, so checking is free; putting money in raises the price for everyone
+behind you, and anyone who had already acted owes the difference before the
+street can close.
 
     join   — each player pays the ante into the pot
     deal   — two hole cards each, and the flop, then a betting round
@@ -13,6 +12,10 @@ Shape of a hand:
     showdown — best five cards from the seven wins the pot
 
 Hands are ranked with the standard categories; ties split the pot.
+
+Money is tracked here only as "how much has this seat put in" — holding it out
+of a player's wallet is the caller's job, which is why `stay`/`raise_to` return
+the amount that needs collecting.
 """
 
 import secrets
@@ -27,6 +30,11 @@ MAX_PLAYERS = 8
 
 # Betting rounds, in order. 'showdown' is not a betting round.
 STAGES = ("flop", "turn", "river", "showdown")
+
+# A raise is a multiple of the ante, which keeps the numbers round and stops
+# anyone raising by 1 forever to stall a table.
+MIN_RAISE_MULTIPLE = 1
+MAX_RAISE_MULTIPLE = 20
 
 CATEGORY_NAMES = {
     8: "Straight flush",
@@ -141,6 +149,10 @@ def new_table(host_id, ante):
         "board": [],
         "pot": 0,
         "ante": ante,
+        # The price of staying in this street. Zero at the top of every street,
+        # which is what makes checking free.
+        "toMatch": 0,
+        "lastRaise": 0,
         "players": [new_player(host_id)],
         "result": None,
     }
@@ -155,7 +167,18 @@ def new_player(user_id, cpu=False, name=None):
         "folded": False,
         "acted": False,
         "contributed": 0,
+        # Put in during the current street only; reset when the street turns.
+        "street": 0,
     }
+
+
+def owed(state, player):
+    """What this player must put in to stay in the hand right now.
+
+    `.get` rather than `[]` on both: a table dealt before betting existed has
+    neither key, and reads as "nothing owed", which is what it was.
+    """
+    return max(0, state.get("toMatch", 0) - player.get("street", 0))
 
 
 # House players sit on negative ids so they can never collide with a real one.
@@ -175,16 +198,38 @@ def add_cpu(state):
 
 
 def cpu_decision(state, player):
-    """Rough but not daft: play made hands, chase less as the board fills."""
+    """Rough but not daft: play made hands, chase less as the board fills.
+
+    Returns one of "check", "call", "raise" or "fold". The house only raises
+    with something worth raising, so a raise is real information.
+    """
     rng = secrets.SystemRandom()
     category = best_hand(player["hole"] + state["board"])["score"][0]
-    if category >= 2:                    # two pair or better
-        return "stay"
-    if category == 1:                    # a pair is usually worth one more card
-        return "stay" if rng.random() < 0.85 else "fold"
-    # Nothing yet — keep looking early, give up late.
-    chase = {"flop": 0.55, "turn": 0.35, "river": 0.18}
-    return "stay" if rng.random() < chase.get(state["stage"], 0.3) else "fold"
+    price = owed(state, player)
+
+    if category >= 3:                    # trips or better — put money in
+        if price == 0 and rng.random() < 0.6:
+            return "raise"
+        if state.get("toMatch", 0) <= state["ante"] * 4 and rng.random() < 0.35:
+            return "raise"
+        return "call" if price else "check"
+
+    if category == 2:                    # two pair: happy to pay, slow to raise
+        return "call" if price else "check"
+
+    if price == 0:
+        # Free card. Take it, and occasionally bluff at a scary board.
+        return "raise" if category == 1 and rng.random() < 0.12 else "check"
+
+    # Paying to continue with not much. Pot odds, roughly: the bigger the ask
+    # relative to the ante, the less often it is worth it.
+    steep = price > state["ante"] * 3
+    if category == 1:
+        return "call" if rng.random() < (0.45 if steep else 0.85) else "fold"
+    chase = {"flop": 0.5, "turn": 0.3, "river": 0.12}.get(state["stage"], 0.25)
+    if steep:
+        chase /= 2
+    return "call" if rng.random() < chase else "fold"
 
 
 def play_cpus(state):
@@ -193,19 +238,25 @@ def play_cpus(state):
     Stops as soon as a human still owes an action, so it never plays past
     someone's decision.
     """
-    for _ in range(len(STAGES) * 2):
+    for _ in range(len(STAGES) * MAX_PLAYERS * 2):
         if state["stage"] in ("waiting", "showdown"):
             break
         pending = [p for p in active(state) if p.get("cpu") and not p["acted"]]
+        if not pending:
+            if hand_over(state) or round_complete(state):
+                advance(state)
+                continue
+            break
         for p in pending:
-            if cpu_decision(state, p) == "stay":
-                stay(state, p["userId"])
-            else:
+            choice = cpu_decision(state, p)
+            if choice == "fold":
                 fold(state, p["userId"])
+            elif choice == "raise":
+                raise_to(state, p["userId"], state["ante"])
+            else:
+                stay(state, p["userId"])
         if hand_over(state) or round_complete(state):
             advance(state)
-        else:
-            break
     return state
 
 
@@ -225,19 +276,46 @@ def deal(state):
         p["hole"] = [deck.pop(), deck.pop()]
         p["folded"] = False
         p["acted"] = False
+        p["street"] = 0
     deck.pop()                                    # burn
     state["board"] = [deck.pop(), deck.pop(), deck.pop()]
     state["deck"] = deck
     state["stage"] = "flop"
+    state["toMatch"] = 0
+    state["lastRaise"] = 0
     return state
 
 
 def stay(state, user_id):
+    """Check (nothing owed) or call. Returns what it cost."""
     p = seat(state, user_id)
+    cost = owed(state, p)
     p["acted"] = True
-    p["contributed"] += state["ante"]
-    state["pot"] += state["ante"]
-    return state
+    p["street"] = p.get("street", 0) + cost
+    p["contributed"] += cost
+    state["pot"] += cost
+    return cost
+
+
+def raise_to(state, user_id, amount):
+    """Call what's owed and put `amount` more on top. Returns the total cost.
+
+    Everyone still in has to answer the new price, so their turn reopens —
+    that is the whole point of a raise and the reason a round can go round
+    more than once.
+    """
+    p = seat(state, user_id)
+    cost = owed(state, p) + amount
+    p["acted"] = True
+    p["street"] = p.get("street", 0) + cost
+    p["contributed"] += cost
+    state["pot"] += cost
+    state["toMatch"] = p["street"]
+    state["lastRaise"] = amount
+    for other in active(state):
+        if other is not p:
+            other["acted"] = False
+    return cost
 
 
 def fold(state, user_id):
@@ -248,7 +326,8 @@ def fold(state, user_id):
 
 
 def round_complete(state):
-    return all(p["acted"] for p in active(state))
+    """Everyone left has acted and has matched the price."""
+    return all(p["acted"] and owed(state, p) == 0 for p in active(state))
 
 
 def hand_over(state):
@@ -275,8 +354,12 @@ def advance(state):
     deck.pop()                                    # burn
     state["board"].append(deck.pop())
     state["stage"] = nxt
+    # New street, new prices: nothing is owed until somebody bets.
+    state["toMatch"] = 0
+    state["lastRaise"] = 0
     for p in state["players"]:
         p["acted"] = p["folded"]
+        p["street"] = 0
     return state
 
 

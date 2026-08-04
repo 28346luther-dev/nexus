@@ -184,22 +184,32 @@ or cancelled; if two people request each other, it auto-accepts.
 
 **Direct messages** — one-to-one conversations with unread badges.
 
-**Gamesman (games and Sana Coin)** — a bot account that joins every server
-automatically, including ones created before it existed. Everything it does is
-driven by slash commands and answered as a card in the channel. Type `/` to see
-the list, arrows to choose, Enter to run.
+**Frontman (games and Sana Coin)** — a masked bot account that joins every
+server automatically, including ones created before it existed. Everything it
+does is driven by slash commands and answered as a card in the channel. Type
+`/` to see the list, arrows to choose, Enter to run.
+
+Its picture is `static/frontman.png`, copied into the uploads directory on
+boot. Replace that file and restart to change the mask; the bot is found by a
+fixed address in the database, so the account, its name and every card it has
+ever posted survive the change.
 
 | Command | What it does |
 |---|---|
 | `/blackjack cpu [bet]` | Against the dealer, which hits to 17. Blackjack pays 3:2 |
 | `/blackjack 1v1 [bet]` | Open a table; anyone in the server can **Join** by matching the stake |
-| `/poker cpu [bet]` | Simplified Hold'em against three house players |
+| `/poker cpu [bet]` | Hold'em against three house players |
 | `/poker table [bet]` | Open a Hold'em table for up to 8 people |
+| `/roulette [bet]` | Single-zero wheel: colours, odds/evens, dozens, columns or a straight number |
 | `/slots <bet>` | Three weighted reels |
-| `/claim` | Collect 1,000 Sana Coin, once every 24 hours |
+| `/claim` | Collect 5,000 Sana Coin, once every 24 hours |
+| `/work` | Do a shift for Sana Coin, once an hour |
+| `/shop` | Spend Sana Coin on permanent perks |
 | `/balance` | Your coins, rank and record |
 | `/bank` | Everyone's balances in this server |
 | `/leaderboard` | Top players by games won |
+| `/poll <question>` | Put a question to the channel and count the votes |
+| `/reset` | Wipe balances and records back to the start — server owner only |
 
 Leave the bet off and you get a **"How much would you like to bet?"** dialog
 with quick amounts, All in, and a For fun option.
@@ -209,15 +219,67 @@ when a hand starts and paid out exactly once. Ranks (Rookie → Chancer →
 Hustler → Sharp → High Roller → Sana Legend) come from **wins, not balance**,
 so they can't simply be bought.
 
+### Working for it
+
+`/work` is an hour's shift for **2,000 Sana Coin** — four times out of five.
+The fifth is a bad day: you reversed the drinks trolley over the boss's cat, or
+let a man in a false moustache walk out with the chip tray, and you go home
+unpaid. The hour still counts.
+
+Every **five hours on the clock** earns a **20% rise**, compounding, until the
+pay packet tops out at **10,000** a shift — about 45 hours of work. The Gold
+Pass doubles whatever you're on, cap included, and the Sana Vault halves the
+wait between shifts.
+
 **Card secrecy.** In 1v1 blackjack you see only your own cards until the hand
 settles, and spectators see neither — showing both would let whoever acts
 second read the total they need. Poker hole cards work the same way. The
 dealer's hole card in the CPU game stays down until you stand.
 
-**Simplified Hold'em** means no raising: each street costs a fixed amount to
-stay in, so every decision is just *stay* or *fold*. Ante to sit, then the
-flop, turn and river each cost the same again. Best five cards of your seven
-wins; ties split the pot.
+### Hold'em
+
+Betting works the way it does at a real table. Everyone antes to sit down.
+Each street then opens with nothing to call, so **Check** is free; **Raise**
+puts money in and sets a price everyone else has to answer, which reopens the
+turn of anyone who had already acted; **Call** matches what's owed and **Fold**
+gets out. Raises go in whole antes, up to twenty at a time. Best five cards of
+your seven wins, and ties split the pot.
+
+### Blackjack
+
+**Double** takes one more card for a second stake and ends the hand.
+**Split** turns a pair into two hands, each drawing a second card and each
+carrying its own stake — you can split up to four hands and double any of
+them. Split aces get one card each and stand, and a 21 made from a split pays
+even money rather than 3:2, exactly as at a real table. Both are for hands
+against the dealer: a 1v1 is a matched stake on both sides, and there is no way
+to match half a split.
+
+### Roulette
+
+37 pockets, single zero. Red/black, odd/even and 1–18/19–36 pay 1 to 1;
+dozens and columns pay 2 to 1; a straight number pays 35 to 1. Zero loses every
+outside bet, which is where the house edge lives.
+
+### The shop
+
+`/shop` sells six things, permanently and without refunds. Prices are steep on
+purpose — the cheapest is a fortnight of showing up, and the Sana Lounge is
+something you win at the tables.
+
+| Perk | Price | What it does |
+|---|---|---|
+| Glowing nameplate | 100,000 | Your name glows in chat, the member list and every leaderboard |
+| VIP badge | 150,000 | A gold VIP tag beside your name |
+| Prismatic ring | 200,000 | An animated ring around your avatar |
+| Gold Pass | 300,000 | `/claim` and `/work` pay double, forever |
+| Sana Vault | 500,000 | `/work` every 30 minutes instead of every hour |
+| Sana Lounge key | 1,000,000 | Opens the private `#sana-lounge` channel |
+
+The **Sana Lounge** appears in every server you are in, now and later, and only
+for people who hold a key — **not even the server owner can see it** without
+one, and it can't be deleted or dragged around. `/reset` levels balances and
+records but leaves perks alone: they were paid for.
 
 **GIFs** — the **GIF** button in the message bar, or `/gif <search>`, opens a
 Giphy picker. Tap ★ on any GIF to keep it,
@@ -239,7 +301,21 @@ that outranks the normal unread count.
 `+` button. PNG, JPEG, GIF and WebP up to 8 MB. Click one to open it full size.
 
 **Reactions** — hover a message and pick an emoji, or click an existing pill to
-join in. Clicking your own reaction again removes it.
+join in. Clicking your own reaction again removes it. Hovering a pill shows
+**who reacted**, with their avatars; the list is refetched each time rather than
+cached, because people add and remove reactions while you're reading.
+
+**Polls** — `/poll` opens a builder: a question, two to six options, and
+optionally more than one answer each. Votes land live for everyone, the leading
+option is highlighted once there is a clear one, and clicking your own choice
+again takes the vote back. Whoever started the poll (or the server owner) can
+close it, which freezes the result on show.
+
+**Muting channels** — hover a channel in the sidebar and hit the bell. A muted
+channel dims, stops showing unread and mention badges, stops counting towards
+the server's badge in the rail, and never chimes. Unread state itself is
+untouched, so unmuting brings back the count that was there all along. Mutes
+are per person.
 
 **Custom stickers** — each server has its own set, managed by the owner under
 *Server options → Manage stickers*. Up to 50 per server, 1 MB each. Removing a
@@ -282,8 +358,9 @@ WebSockets and moving from SQLite to Postgres.
 |--------------------|------------------------------------------------|
 | `app.py`           | HTTP server, routing, all API endpoints        |
 | `db.py`            | Schema, migrations, password hashing           |
-| `blackjack.py`     | Card and hand rules for the Gamesman bot       |
-| `poker.py`         | Hold'em rules and hand ranking                 |
+| `blackjack.py`     | Card and hand rules, including splits and doubles |
+| `poker.py`         | Hold'em rules, betting and hand ranking        |
+| `roulette.py`      | The wheel, the bet types and their odds        |
 | `slots.py`         | Slot reels and payout table                    |
 | `tests/`           | Plain-Python API tests; see tests/README.md    |
 | `images.py`        | Image sniffing and size checks for uploads     |

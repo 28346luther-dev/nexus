@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 
--- A blackjack hand posted by the Gamesman bot. `state` is the JSON blob from
+-- A blackjack hand posted by the Frontman bot. `state` is the JSON blob from
 -- blackjack.py; the message it is attached to renders it as a card.
 CREATE TABLE IF NOT EXISTS games (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,7 +197,51 @@ CREATE TABLE IF NOT EXISTS gif_favourites (
 );
 CREATE INDEX IF NOT EXISTS idx_gif_fav_user ON gif_favourites(user_id, id DESC);
 
--- Running totals per player for the Gamesman leaderboard.
+-- Things bought from the Frontman's shop. One row per perk per person; the
+-- price paid is kept so a refund or an audit doesn't need the price list.
+CREATE TABLE IF NOT EXISTS purchases (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item       TEXT NOT NULL,
+    price      INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (user_id, item)
+);
+
+-- Muted channels. A row means "no badges and no chime from this channel";
+-- unread state itself is untouched, so unmuting restores the real counts.
+CREATE TABLE IF NOT EXISTS channel_mutes (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    UNIQUE (user_id, channel_id)
+);
+
+-- A poll posted with /poll. `options` is a JSON list of labels; votes point at
+-- an index into it, so editing is impossible and the labels can't drift.
+CREATE TABLE IF NOT EXISTS polls (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+    author_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    question   TEXT NOT NULL,
+    options    TEXT NOT NULL,
+    multi      INTEGER NOT NULL DEFAULT 0,
+    closed     INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS poll_votes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    poll_id    INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    choice     INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (poll_id, user_id, choice)
+);
+CREATE INDEX IF NOT EXISTS idx_poll_votes ON poll_votes(poll_id);
+
+-- Running totals per player for the Frontman leaderboard.
 CREATE TABLE IF NOT EXISTS game_stats (
     user_id     INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     wins        INTEGER NOT NULL DEFAULT 0,
@@ -256,8 +300,39 @@ def init():
 # ---------------------------------------------------------------- Sana Coin
 
 STARTING_COINS = 2000
-DAILY_CLAIM = 1000
+DAILY_CLAIM = 5000
 CLAIM_INTERVAL = 60 * 60 * 24
+
+# The shift. Frequent enough that someone who busts out is never stuck waiting
+# a day to play, and unreliable enough that it isn't a substitute for playing:
+# one shift in five goes wrong and pays nothing.
+WORK_PAY = 2000
+WORK_INTERVAL = 60 * 60
+WORK_INTERVAL_VAULT = 60 * 30     # halved by the Sana Vault perk
+WORK_SUCCESS = 0.8
+
+# Stick at it and you get a rise: 20% more every five hours on the clock,
+# compounding, until the pay packet tops out.
+WORK_RAISE = 0.2
+WORK_RAISE_EVERY = 5
+WORK_MAX_PAY = 10_000
+
+
+def work_rate(shifts):
+    """Base pay for the next shift, after every rise earned so far.
+
+    Hours count whether or not the shift went well — a wasted afternoon is
+    still an afternoon, and losing the pay is punishment enough.
+    """
+    rises = shifts // WORK_RAISE_EVERY
+    return min(WORK_MAX_PAY, round(WORK_PAY * (1 + WORK_RAISE) ** rises))
+
+
+def shifts_to_raise(shifts):
+    """Hours left before the next rise, or 0 once the pay has topped out."""
+    if work_rate(shifts) >= WORK_MAX_PAY:
+        return 0
+    return WORK_RAISE_EVERY - (shifts % WORK_RAISE_EVERY)
 
 # Rank is earned by wins, not by balance, so it can't simply be bought.
 RANKS = [
@@ -333,14 +408,132 @@ def record_result(conn, user_id, outcome, profit, wagered):
     )
 
 
-BOT_NAME = "Gamesman"
+# ---------------------------------------------------------------- the shop
+
+# Perks are permanent and deliberately expensive: at 5,000 a day from /claim
+# and 500 an hour from /work, the cheapest is a fortnight of showing up and the
+# Sana Lounge is something you win at the tables rather than wait for.
+SHOP_ITEMS = [
+    {
+        "id": "glow",
+        "name": "Glowing nameplate",
+        "price": 100_000,
+        "icon": "✨",
+        "summary": "Your name glows wherever it appears.",
+        "detail": "Chat, the member list and every leaderboard.",
+    },
+    {
+        "id": "badge",
+        "name": "VIP badge",
+        "price": 150_000,
+        "icon": "✦",
+        "summary": "A VIP tag beside your name.",
+        "detail": "Sits where the BOT tag does, in gold.",
+    },
+    {
+        "id": "ring",
+        "name": "Prismatic ring",
+        "price": 200_000,
+        "icon": "◍",
+        "summary": "An animated ring around your avatar.",
+        "detail": "Shows on your messages, the member list and your profile.",
+    },
+    {
+        "id": "goldpass",
+        "name": "Gold Pass",
+        "price": 300_000,
+        "icon": "🏅",
+        "summary": "Double pay from /claim and /work, forever.",
+        "detail": f"{DAILY_CLAIM * 2:,} a day, and double whatever your shift "
+                  f"is paying — {WORK_MAX_PAY * 2:,} once you're on top rate.",
+    },
+    {
+        "id": "vault",
+        "name": "Sana Vault",
+        "price": 500_000,
+        "icon": "🏦",
+        "summary": "Work every 30 minutes instead of every hour.",
+        "detail": "Stacks with the Gold Pass.",
+    },
+    {
+        "id": "lounge",
+        "name": "Sana Lounge key",
+        "price": 1_000_000,
+        "icon": "🔑",
+        "summary": "Opens the private #sana-lounge channel.",
+        "detail": "In every server you are in, now and later. Nobody without a "
+                  "key can see it — not even the server owner.",
+    },
+]
+
+SHOP_BY_ID = {item["id"]: item for item in SHOP_ITEMS}
+
+LOUNGE_CHANNEL = "sana-lounge"
+
+
+def perks_for(conn, user_id):
+    """The set of shop items this player owns."""
+    return {
+        r["item"]
+        for r in conn.execute("SELECT item FROM purchases WHERE user_id = ?", (user_id,))
+    }
+
+
+def perks_map(conn, user_ids):
+    """{user_id: {perk, ...}} for a batch of people, in one query."""
+    ids = list(user_ids)
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    out = {uid: set() for uid in ids}
+    for r in conn.execute(
+        f"SELECT user_id, item FROM purchases WHERE user_id IN ({marks})", ids
+    ):
+        out[r["user_id"]].add(r["item"])
+    return out
+
+
+def claim_amount(perks):
+    return DAILY_CLAIM * 2 if "goldpass" in perks else DAILY_CLAIM
+
+
+def work_pay(perks, shifts=0):
+    """What the next successful shift pays this person.
+
+    The Gold Pass doubles it on top of the cap: a perk that cost 300,000 has
+    to keep meaning something once someone has worked their way to the top.
+    """
+    rate = work_rate(shifts)
+    return rate * 2 if "goldpass" in perks else rate
+
+
+def work_interval(perks):
+    return WORK_INTERVAL_VAULT if "vault" in perks else WORK_INTERVAL
+
+
+BOT_NAME = "Frontman"
 BOT_TAG = "0000"
+# The bot's identity in the database, and the reason it still says "gamesman":
+# ensure_bot finds the account by this address. Changing it would leave the
+# old bot in place with every card it ever posted and stand a second one
+# beside it, so the name changes and the address does not.
 BOT_EMAIL = "gamesman@nexus.bot"
-BOT_COLOR = "#3ba55d"
+# The name is drawn in this colour, so it has to read against a dark
+# background — the mask's own near-black would be invisible.
+BOT_COLOR = "#d6d9e2"
+BOT_BIO = "Runs the games. Type / to see what's on."
+
+# The mask, kept in the repo and copied into the uploads directory on boot.
+# Uploads are only served under a strict 32-hex name, so its stored name is
+# derived from a constant rather than being random like everyone else's.
+BOT_AVATAR_SRC = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "static", "frontman.png"
+)
+BOT_AVATAR_NAME = hashlib.sha256(b"frontman-avatar").hexdigest()[:32] + ".png"
 
 
 def ensure_bot(conn):
-    """Create the Gamesman account and put it in every server.
+    """Create the Frontman account and put it in every server.
 
     It owns no password anyone can use — the hash is random bytes and login
     refuses bot accounts outright — but it needs a real users row so its
@@ -349,6 +542,13 @@ def ensure_bot(conn):
     row = conn.execute("SELECT id FROM users WHERE email = ?", (BOT_EMAIL,)).fetchone()
     if row:
         bot_id = row["id"]
+        # Renaming the bot has to reach databases that already exist, or an
+        # older install keeps whatever it was called when it was created.
+        conn.execute(
+            "UPDATE users SET username = ?, discriminator = ?, bio = ?, color = ?"
+            " WHERE id = ?",
+            (BOT_NAME, BOT_TAG, BOT_BIO, BOT_COLOR, bot_id),
+        )
     else:
         pw_hash, salt = hash_password(secrets.token_hex(32))
         cur = conn.execute(
@@ -356,9 +556,11 @@ def ensure_bot(conn):
             " color, bio, created_at, last_seen, is_bot)"
             " VALUES (?,?,?,?,?,?,?,?,?,1)",
             (BOT_NAME, BOT_TAG, BOT_EMAIL, pw_hash, salt, BOT_COLOR,
-             "Deals blackjack. Type /blackjack to play.", now(), now()),
+             BOT_BIO, now(), now()),
         )
         bot_id = cur.lastrowid
+
+    ensure_bot_avatar(conn, bot_id)
 
     # Join any server it isn't in yet, including ones made before it existed.
     conn.execute(
@@ -369,6 +571,30 @@ def ensure_bot(conn):
         (bot_id, now(), bot_id),
     )
     return bot_id
+
+
+def ensure_bot_avatar(conn, uid):
+    """Copy the mask into the uploads directory and point the bot at it.
+
+    Re-copied whenever the bytes differ, so replacing static/frontman.png and
+    restarting is all it takes to change the bot's picture — on a Railway
+    volume the uploads directory outlives the deploy that wrote it.
+    """
+    try:
+        with open(BOT_AVATAR_SRC, "rb") as fh:
+            source = fh.read()
+    except OSError:
+        return                      # no picture in the repo: keep the initial
+    target = os.path.join(UPLOAD_DIR, BOT_AVATAR_NAME)
+    try:
+        with open(target, "rb") as fh:
+            current = fh.read()
+    except OSError:
+        current = None
+    if current != source:
+        with open(target, "wb") as fh:
+            fh.write(source)
+    conn.execute("UPDATE users SET avatar = ? WHERE id = ?", (BOT_AVATAR_NAME, uid))
 
 
 def bot_id(conn):
@@ -398,8 +624,16 @@ def migrate(conn):
             f"ALTER TABLE users ADD COLUMN coins INTEGER NOT NULL DEFAULT {STARTING_COINS}"
         )
         conn.execute("ALTER TABLE users ADD COLUMN last_claim INTEGER NOT NULL DEFAULT 0")
+    if "last_work" not in have:
+        conn.execute("ALTER TABLE users ADD COLUMN last_work INTEGER NOT NULL DEFAULT 0")
+    if "work_shifts" not in have:
+        # Hours on the clock, which is what earns the 20% rises.
+        conn.execute("ALTER TABLE users ADD COLUMN work_shifts INTEGER NOT NULL DEFAULT 0")
 
     have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)")}
+    if "locked" not in have:
+        # 0 for an ordinary channel; otherwise the shop perk that unlocks it.
+        conn.execute("ALTER TABLE channels ADD COLUMN locked TEXT NOT NULL DEFAULT ''")
     if "position" not in have:
         conn.execute("ALTER TABLE channels ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
         # Seed the order from the existing ids so nothing appears to move.
@@ -425,6 +659,13 @@ def migrate(conn):
         conn.execute(
             "ALTER TABLE messages ADD COLUMN game_id INTEGER"
             " REFERENCES games(id) ON DELETE CASCADE"
+        )
+
+    if "poll_id" not in have:
+        # A poll message carries no text of its own; the card is the message.
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN poll_id INTEGER"
+            " REFERENCES polls(id) ON DELETE CASCADE"
         )
 
     have = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
@@ -502,9 +743,10 @@ def avatar_url(row):
     return f"/uploads/{name}" if name else None
 
 
-def public_user(row, online=False):
+def public_user(row, online=False, perks=()):
     return {
         "id": row["id"],
+        "perks": sorted(perks),
         "username": row["username"],
         "discriminator": row["discriminator"],
         "tag": f'{row["username"]}#{row["discriminator"]}',

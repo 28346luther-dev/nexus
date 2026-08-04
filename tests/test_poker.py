@@ -126,7 +126,8 @@ check("unknown action rejected", s == 400, (s, r))
 
 s, r = host.call("POST", f"/api/games/{pid}/poker/action", {"action": "stay"})
 check("host stays", s == 200, r)
-check("staying costs the ante again", r["wallet"]["coins"] == 1800, r["wallet"])
+# Nobody has bet this street, so there is nothing to call and it is free.
+check("checking round costs nothing", r["wallet"]["coins"] == 1900, r["wallet"])
 s, r = host.call("POST", f"/api/games/{pid}/poker/action", {"action": "stay"})
 check("can't act twice in a round", s == 409, (s, r))
 
@@ -138,7 +139,8 @@ s, r = p3.call("POST", f"/api/games/{pid}/poker/action", {"action": "stay"})
 t = r["message"]["game"]
 check("round advances once all have acted", t["stage"] == "turn", t["stage"])
 check("turn adds a fourth card", len(t["board"]) == 4, t["board"])
-check("pot collected the round", t["pot"] == 600, t["pot"])
+# Three antes and a street everyone checked: the pot is still the antes.
+check("a checked round adds nothing to the pot", t["pot"] == 300, t["pot"])
 
 # --------------------------------------------------------------- to the end
 for who in (host, p2, p3):

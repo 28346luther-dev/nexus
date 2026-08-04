@@ -28,6 +28,7 @@ import blackjack
 import db
 import images
 import poker
+import roulette
 import slots
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -153,6 +154,17 @@ class Req:
 
 # ------------------------------------------------------------------ helpers
 
+def public_user(conn, row, online=None):
+    """db.public_user, plus the shop perks that change how a name is drawn.
+
+    Perks need a query, which db.public_user has no connection to make, so
+    every caller that has one goes through here instead.
+    """
+    if online is None:
+        online = db.is_online(row)
+    return db.public_user(row, online, db.perks_for(conn, row["id"]))
+
+
 def guild_member_or_403(req, guild_id):
     row = req.conn.execute(
         "SELECT 1 FROM guild_members WHERE guild_id = ? AND user_id = ?",
@@ -176,7 +188,17 @@ def channel_access_or_403(req, channel_id):
             raise HttpError(403, "That conversation is not yours.")
     else:
         guild_member_or_403(req, ch["guild_id"])
+        # A locked channel is one the shop sells the key to. Owning the server
+        # is not enough — the whole point is that the key has to be bought.
+        if locked_of(ch) and locked_of(ch) not in db.perks_for(req.conn, req.user["id"]):
+            raise HttpError(403, "That channel is locked. The Frontman sells the key.")
     return ch
+
+
+def locked_of(channel):
+    """Which perk unlocks this channel, or '' for an ordinary one."""
+    keys = channel.keys()
+    return channel["locked"] if "locked" in keys and channel["locked"] else ""
 
 
 # A mention is written as the author's full tag so the composer stays readable;
@@ -220,6 +242,8 @@ def can_read_channel(conn, channel, user_id):
         q = "SELECT 1 FROM dm_participants WHERE channel_id = ? AND user_id = ?"
         args = (channel["id"], user_id)
     else:
+        if locked_of(channel) and locked_of(channel) not in db.perks_for(conn, user_id):
+            return False
         q = "SELECT 1 FROM guild_members WHERE guild_id = ? AND user_id = ?"
         args = (channel["guild_id"], user_id)
     return bool(conn.execute(q, args).fetchone())
@@ -243,6 +267,11 @@ def serialize_messages(conn, rows, user_id):
     by_id = {m["id"]: m for m in out}
     ids = list(by_id)
     marks = ",".join("?" * len(ids))
+
+    # Shop perks decide how an author's name is drawn, so they travel with it.
+    perks = db.perks_map(conn, {m["author"]["id"] for m in out})
+    for m in out:
+        m["author"]["perks"] = sorted(perks.get(m["author"]["id"], ()))
 
     # Which of these ping the viewer
     for r in conn.execute(
@@ -328,6 +357,18 @@ def serialize_messages(conn, rows, user_id):
             if g:
                 m["game"] = serialize_game(conn, g, user_id)
 
+    poll_ids = [m["pollId"] for m in out if m["pollId"]]
+    if poll_ids:
+        pmarks = ",".join("?" * len(poll_ids))
+        polls = {
+            p["id"]: p
+            for p in conn.execute(f"SELECT * FROM polls WHERE id IN ({pmarks})", poll_ids)
+        }
+        for m in out:
+            p = polls.get(m["pollId"])
+            if p:
+                m["poll"] = serialize_poll(conn, p, user_id)
+
     sticker_ids = [m["stickerId"] for m in out if m["stickerId"]]
     if sticker_ids:
         smarks = ",".join("?" * len(sticker_ids))
@@ -367,6 +408,8 @@ def serialize_message(row):
         "replyTo": None,
         "gameId": row["game_id"] if "game_id" in keys else None,
         "game": None,
+        "pollId": row["poll_id"] if "poll_id" in keys else None,
+        "poll": None,
         "mentionsMe": False,
         "attachments": [],
         "reactions": [],
@@ -378,6 +421,8 @@ def serialize_message(row):
             "color": row["color"],
             "avatarUrl": f"/uploads/{row['avatar']}" if row["avatar"] else None,
             "isBot": bool(row["is_bot"]),
+            # Filled in by serialize_messages, which can batch the lookup.
+            "perks": [],
         },
     }
 
@@ -479,7 +524,16 @@ def channel_revision(conn, channel_id):
         " WHERE channel_id = ?",
         (channel_id,),
     ).fetchone()
-    return f"{m['a']}.{m['b']}.{m['c']}-{r['a']}.{r['b']}-{g['a']}.{g['b']}"
+    # Votes are rows of their own and never touch the message, so a poll would
+    # sit at its opening tally for everyone but the person clicking.
+    p = conn.execute(
+        "SELECT COALESCE(MAX(v.id), 0) a, COUNT(v.id) b, COALESCE(SUM(p.closed), 0) c"
+        " FROM polls p LEFT JOIN poll_votes v ON v.poll_id = p.id"
+        " WHERE p.channel_id = ?",
+        (channel_id,),
+    ).fetchone()
+    return (f"{m['a']}.{m['b']}.{m['c']}-{r['a']}.{r['b']}-{g['a']}.{g['b']}"
+            f"-{p['a']}.{p['b']}.{p['c']}")
 
 
 # ------------------------------------------------------------------ auth API
@@ -530,7 +584,7 @@ def start_session(req, user_id):
         req.conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (db.now(), user_id))
     req.set_cookie = token
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    return {"user": me_payload(row)}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
 
 
 @route("POST", r"/api/logout")
@@ -543,9 +597,10 @@ def api_logout(req):
     return {"ok": True}
 
 
-def me_payload(row):
+def me_payload(row, perks=()):
     return {
         "id": row["id"],
+        "perks": sorted(perks),
         "username": row["username"],
         "discriminator": row["discriminator"],
         "tag": f'{row["username"]}#{row["discriminator"]}',
@@ -562,7 +617,7 @@ def api_me(req):
     if not req.user:
         return {"user": None}
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
-    return {"user": me_payload(row)}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
 
 
 @route("PATCH", r"/api/me")
@@ -600,7 +655,7 @@ def api_update_me(req):
         with req.conn:
             req.conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", values)
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
-    return {"user": me_payload(row)}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
 
 
 # ---------------------------------------------------------------- guild API
@@ -610,17 +665,27 @@ def api_guilds(req):
     req.require_auth()
     uid = req.user["id"]
     guilds = []
+    perks = db.perks_for(req.conn, uid)
+    muted = muted_channels(req.conn, uid)
     rows = req.conn.execute(
         "SELECT g.* FROM guilds g JOIN guild_members m ON m.guild_id = g.id"
         " WHERE m.user_id = ? ORDER BY m.joined_at",
         (uid,),
     ).fetchall()
     for g in rows:
-        channels = req.conn.execute(
-            "SELECT * FROM channels WHERE guild_id = ? AND kind = 'text'"
-            " ORDER BY position, id",
-            (g["id"],),
-        ).fetchall()
+        # Someone who bought a key expects a door in every server they're in,
+        # including ones they joined after buying it.
+        if "lounge" in perks:
+            ensure_lounge(req.conn, g["id"])
+        channels = [
+            c
+            for c in req.conn.execute(
+                "SELECT * FROM channels WHERE guild_id = ? AND kind = 'text'"
+                " ORDER BY position, id",
+                (g["id"],),
+            )
+            if not locked_of(c) or locked_of(c) in perks
+        ]
         guilds.append(
             {
                 "id": g["id"],
@@ -637,6 +702,8 @@ def api_guilds(req):
                         "id": c["id"],
                         "name": c["name"],
                         "topic": c["topic"],
+                        "locked": locked_of(c),
+                        "muted": c["id"] in muted,
                         "unread": unread_count(req.conn, uid, c["id"]),
                         "mentions": mention_count(req.conn, uid, c["id"]),
                     }
@@ -662,7 +729,7 @@ def api_create_guild(req):
             "INSERT INTO guild_members (guild_id, user_id, joined_at) VALUES (?,?,?)",
             (gid, req.user["id"], ts),
         )
-        # Every server gets the Gamesman.
+        # Every server gets the Frontman.
         bot = db.bot_id(req.conn)
         if bot:
             req.conn.execute(
@@ -670,10 +737,11 @@ def api_create_guild(req):
                 " VALUES (?,?,?)",
                 (gid, bot, ts),
             )
-        for chan in ("general", "random"):
+        for position, chan in enumerate(("general", "random")):
             req.conn.execute(
-                "INSERT INTO channels (guild_id, kind, name, created_at) VALUES (?,'text',?,?)",
-                (gid, chan, ts),
+                "INSERT INTO channels (guild_id, kind, name, position, created_at)"
+                " VALUES (?,'text',?,?,?)",
+                (gid, chan, position, ts),
             )
     first = req.conn.execute(
         "SELECT id FROM channels WHERE guild_id = ? ORDER BY id LIMIT 1", (gid,)
@@ -754,10 +822,14 @@ def api_reorder_channels(req, guild_id):
     if not isinstance(wanted, list) or not wanted:
         raise HttpError(400, "Send the channel ids in their new order.")
 
+    # Locked channels are left out: they sort to the bottom on their own, and
+    # an owner without a key can't see one to drag it anywhere.
     mine = [
         r["id"]
         for r in req.conn.execute(
-            "SELECT id FROM channels WHERE guild_id = ? AND kind = 'text'", (guild_id,)
+            "SELECT id FROM channels WHERE guild_id = ? AND kind = 'text'"
+            " AND locked = ''",
+            (guild_id,),
         )
     ]
     try:
@@ -817,8 +889,11 @@ def api_delete_channel(req, channel_id):
     if not ch or ch["kind"] != "text":
         raise HttpError(404, "Channel not found.")
     owner_only(req, ch["guild_id"])
+    if locked_of(ch):
+        raise HttpError(400, "The Sana Lounge belongs to whoever bought a key.")
     remaining = req.conn.execute(
-        "SELECT COUNT(*) c FROM channels WHERE guild_id = ? AND kind = 'text'",
+        "SELECT COUNT(*) c FROM channels WHERE guild_id = ? AND kind = 'text'"
+        " AND locked = ''",
         (ch["guild_id"],),
     ).fetchone()["c"]
     if remaining <= 1:
@@ -841,7 +916,7 @@ def api_guild_members(req, guild_id):
     ).fetchall()
     members = []
     for r in rows:
-        item = db.public_user(r, db.is_online(r))
+        item = public_user(req.conn, r)
         item["isOwner"] = r["id"] == g["owner_id"]
         members.append(item)
     members.sort(key=lambda m: (not m["online"], not m["isOwner"], m["username"].lower()))
@@ -969,7 +1044,7 @@ def api_set_avatar(req):
         )
     discard_upload(previous)
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
-    return {"user": me_payload(row)}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
 
 
 @route("DELETE", r"/api/me/avatar")
@@ -983,7 +1058,7 @@ def api_clear_avatar(req):
         req.conn.execute("UPDATE users SET avatar = NULL WHERE id = ?", (req.user["id"],))
     discard_upload(previous)
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
-    return {"user": me_payload(row)}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
 
 
 # ------------------------------------------------------------- stickers API
@@ -1458,14 +1533,58 @@ def api_list_reactors(req, message_id):
         raise HttpError(404, "Message not found.")
     channel_access_or_403(req, msg["channel_id"])
     rows = req.conn.execute(
-        "SELECT r.emoji, u.username FROM reactions r JOIN users u ON u.id = r.user_id"
-        " WHERE r.message_id = ? ORDER BY r.id",
+        "SELECT r.emoji, u.id, u.username, u.color, u.avatar FROM reactions r"
+        " JOIN users u ON u.id = r.user_id WHERE r.message_id = ? ORDER BY r.id",
         (msg["id"],),
     ).fetchall()
     grouped = {}
     for r in rows:
-        grouped.setdefault(r["emoji"], []).append(r["username"])
+        grouped.setdefault(r["emoji"], []).append({
+            "id": r["id"],
+            "username": r["username"],
+            "color": r["color"],
+            "avatarUrl": f"/uploads/{r['avatar']}" if r["avatar"] else None,
+        })
     return {"reactors": grouped}
+
+
+# ------------------------------------------------------------------- mutes
+
+def muted_channels(conn, user_id):
+    return {
+        r["channel_id"]
+        for r in conn.execute(
+            "SELECT channel_id FROM channel_mutes WHERE user_id = ?", (user_id,)
+        )
+    }
+
+
+@route("POST", r"/api/channels/(\d+)/mute")
+def api_toggle_mute(req, channel_id):
+    """Silence a channel, or bring it back. Unread state is left alone, so
+    unmuting shows the badge that was there all along."""
+    req.require_auth()
+    channel_id = int(channel_id)
+    channel_access_or_403(req, channel_id)
+    want = req.body.get("muted")
+    existing = req.conn.execute(
+        "SELECT 1 FROM channel_mutes WHERE user_id = ? AND channel_id = ?",
+        (req.user["id"], channel_id),
+    ).fetchone()
+    muted = (not existing) if want is None else bool(want)
+    with req.conn:
+        if muted:
+            req.conn.execute(
+                "INSERT OR IGNORE INTO channel_mutes (user_id, channel_id, created_at)"
+                " VALUES (?,?,?)",
+                (req.user["id"], channel_id, db.now()),
+            )
+        else:
+            req.conn.execute(
+                "DELETE FROM channel_mutes WHERE user_id = ? AND channel_id = ?",
+                (req.user["id"], channel_id),
+            )
+    return {"muted": muted}
 
 
 @route("POST", r"/api/channels/(\d+)/read")
@@ -1478,6 +1597,161 @@ def api_mark_read(req, channel_id):
     ).fetchone()["v"]
     mark_read(req.conn, req.user["id"], channel_id, top)
     return {"ok": True}
+
+
+# ------------------------------------------------------------------- polls
+
+MAX_POLL_OPTIONS = 6
+MIN_POLL_OPTIONS = 2
+MAX_POLL_QUESTION = 200
+MAX_POLL_OPTION = 80
+
+
+def serialize_poll(conn, row, viewer_id):
+    options = json.loads(row["options"])
+    votes = conn.execute(
+        "SELECT choice, COUNT(*) c,"
+        " SUM(CASE WHEN user_id = ? THEN 1 ELSE 0 END) mine"
+        " FROM poll_votes WHERE poll_id = ? GROUP BY choice",
+        (viewer_id, row["id"]),
+    ).fetchall()
+    counts = {r["choice"]: r for r in votes}
+    total = sum(r["c"] for r in votes)
+    voters = conn.execute(
+        "SELECT COUNT(DISTINCT user_id) c FROM poll_votes WHERE poll_id = ?", (row["id"],)
+    ).fetchone()["c"]
+    author = conn.execute(
+        "SELECT * FROM users WHERE id = ?", (row["author_id"],)
+    ).fetchone()
+    return {
+        "id": row["id"],
+        "question": row["question"],
+        "multi": bool(row["multi"]),
+        "closed": bool(row["closed"]),
+        "isAuthor": row["author_id"] == viewer_id,
+        "author": public_user(conn, author) if author else None,
+        "voters": voters,
+        "total": total,
+        "options": [
+            {
+                "index": i,
+                "label": label,
+                "votes": counts[i]["c"] if i in counts else 0,
+                "mine": bool(counts[i]["mine"]) if i in counts else False,
+                # Shares of the vote, not of the voters: with multiple choice
+                # allowed the two are different numbers.
+                "share": round((counts[i]["c"] if i in counts else 0) * 100 / total)
+                         if total else 0,
+            }
+            for i, label in enumerate(options)
+        ],
+    }
+
+
+@route("POST", r"/api/channels/(\d+)/polls")
+def api_create_poll(req, channel_id):
+    req.require_auth()
+    channel_id = int(channel_id)
+    ch = channel_access_or_403(req, channel_id)
+
+    question = req.field("question", maxlen=MAX_POLL_QUESTION)
+    raw = req.body.get("options")
+    if not isinstance(raw, list):
+        raise HttpError(400, "Send the poll's options as a list.")
+    options = []
+    for item in raw:
+        label = " ".join(str(item).split())[:MAX_POLL_OPTION]
+        if label and label not in options:
+            options.append(label)
+    if len(options) < MIN_POLL_OPTIONS:
+        raise HttpError(400, "A poll needs at least two different options.")
+    if len(options) > MAX_POLL_OPTIONS:
+        raise HttpError(400, f"A poll can have at most {MAX_POLL_OPTIONS} options.")
+
+    now = db.now()
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO polls (channel_id, author_id, question, options, multi,"
+            " created_at) VALUES (?,?,?,?,?,?)",
+            (channel_id, req.user["id"], question, json.dumps(options),
+             1 if req.body.get("multi") else 0, now),
+        )
+        poll_id = cur.lastrowid
+        msg = req.conn.execute(
+            "INSERT INTO messages (channel_id, author_id, content, created_at, poll_id)"
+            " VALUES (?,?,'',?,?)",
+            (channel_id, req.user["id"], now, poll_id),
+        )
+        req.conn.execute(
+            "UPDATE polls SET message_id = ? WHERE id = ?", (msg.lastrowid, poll_id)
+        )
+    mark_read(req.conn, req.user["id"], channel_id, msg.lastrowid)
+    return {"message": serialize_one(req.conn, msg.lastrowid, req.user["id"])}
+
+
+def load_poll(req, poll_id):
+    row = req.conn.execute("SELECT * FROM polls WHERE id = ?", (int(poll_id),)).fetchone()
+    if not row:
+        raise HttpError(404, "That poll no longer exists.")
+    channel_access_or_403(req, row["channel_id"])
+    return row
+
+
+@route("POST", r"/api/polls/(\d+)/vote")
+def api_vote(req, poll_id):
+    """Cast or take back a vote. Clicking your own choice again removes it."""
+    req.require_auth()
+    row = load_poll(req, poll_id)
+    if row["closed"]:
+        raise HttpError(409, "That poll is closed.")
+    options = json.loads(row["options"])
+    try:
+        choice = int(req.body.get("choice"))
+    except (TypeError, ValueError):
+        raise HttpError(400, "Pick one of the options.")
+    if not 0 <= choice < len(options):
+        raise HttpError(400, "That isn't one of the options.")
+
+    existing = req.conn.execute(
+        "SELECT id FROM poll_votes WHERE poll_id = ? AND user_id = ? AND choice = ?",
+        (row["id"], req.user["id"], choice),
+    ).fetchone()
+    with req.conn:
+        if existing:
+            req.conn.execute("DELETE FROM poll_votes WHERE id = ?", (existing["id"],))
+        else:
+            # Single-choice polls hold one vote per person, so picking a new
+            # option moves the old one rather than stacking on top of it.
+            if not row["multi"]:
+                req.conn.execute(
+                    "DELETE FROM poll_votes WHERE poll_id = ? AND user_id = ?",
+                    (row["id"], req.user["id"]),
+                )
+            req.conn.execute(
+                "INSERT INTO poll_votes (poll_id, user_id, choice, created_at)"
+                " VALUES (?,?,?,?)",
+                (row["id"], req.user["id"], choice, db.now()),
+            )
+    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"])}
+
+
+@route("POST", r"/api/polls/(\d+)/close")
+def api_close_poll(req, poll_id):
+    req.require_auth()
+    row = load_poll(req, poll_id)
+    if row["author_id"] != req.user["id"]:
+        ch = req.conn.execute(
+            "SELECT * FROM channels WHERE id = ?", (row["channel_id"],)
+        ).fetchone()
+        owner = ch["kind"] == "text" and req.conn.execute(
+            "SELECT 1 FROM guilds WHERE id = ? AND owner_id = ?",
+            (ch["guild_id"], req.user["id"]),
+        ).fetchone()
+        if not owner:
+            raise HttpError(403, "Only whoever started the poll can close it.")
+    with req.conn:
+        req.conn.execute("UPDATE polls SET closed = 1 WHERE id = ?", (row["id"],))
+    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"])}
 
 
 # --------------------------------------------------------------- friend API
@@ -1622,7 +1896,7 @@ def api_dms(req):
         dms.append(
             {
                 "channelId": r["id"],
-                "user": db.public_user(other, db.is_online(other)),
+                "user": public_user(req.conn, other),
                 "unread": unread_count(req.conn, uid, r["id"]),
                 "mentions": mention_count(req.conn, uid, r["id"]),
                 "lastMessage": last["content"] if last else None,
@@ -1803,14 +2077,27 @@ def api_add_favourite(req):
 # ------------------------------------------------------------ Sana Coin API
 
 def wallet_payload(conn, user_id):
-    row = conn.execute("SELECT coins, last_claim FROM users WHERE id = ?", (user_id,)).fetchone()
+    row = conn.execute(
+        "SELECT coins, last_claim, last_work, work_shifts FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
     st = db.stats_for(conn, user_id)
+    perks = db.perks_for(conn, user_id)
     waited = db.now() - row["last_claim"]
+    shift = db.work_interval(perks)
+    worked = db.now() - row["last_work"]
     return {
         "coins": row["coins"],
         "canClaim": waited >= db.CLAIM_INTERVAL,
         "claimIn": max(0, db.CLAIM_INTERVAL - waited),
-        "dailyAmount": db.DAILY_CLAIM,
+        "dailyAmount": db.claim_amount(perks),
+        "canWork": worked >= shift,
+        "workIn": max(0, shift - worked),
+        "workPay": db.work_pay(perks, row["work_shifts"]),
+        "workShifts": row["work_shifts"],
+        "shiftsToRaise": db.shifts_to_raise(row["work_shifts"]),
+        "workOdds": db.WORK_SUCCESS,
+        "perks": sorted(perks),
         "stats": {
             "wins": st["wins"],
             "losses": st["losses"],
@@ -1832,6 +2119,14 @@ def api_wallet(req):
     return wallet_payload(req.conn, req.user["id"])
 
 
+def wait_text(seconds):
+    hours = seconds // 3600
+    mins = (seconds % 3600) // 60
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m" if mins else "under a minute"
+
+
 @route("POST", r"/api/wallet/claim")
 def api_claim(req):
     """The daily top-up. One per 24h, so nobody can farm it."""
@@ -1841,16 +2136,169 @@ def api_claim(req):
     ).fetchone()
     waited = db.now() - row["last_claim"]
     if waited < db.CLAIM_INTERVAL:
-        hours = (db.CLAIM_INTERVAL - waited) // 3600
-        mins = ((db.CLAIM_INTERVAL - waited) % 3600) // 60
-        when = f"{hours}h {mins}m" if hours else f"{mins}m"
+        when = wait_text(db.CLAIM_INTERVAL - waited)
         raise HttpError(429, f"You've already claimed today. Come back in {when}.")
+    amount = db.claim_amount(db.perks_for(req.conn, req.user["id"]))
     with req.conn:
         req.conn.execute(
             "UPDATE users SET coins = coins + ?, last_claim = ? WHERE id = ?",
-            (db.DAILY_CLAIM, db.now(), req.user["id"]),
+            (amount, db.now(), req.user["id"]),
         )
-    return {"claimed": db.DAILY_CLAIM, **wallet_payload(req.conn, req.user["id"])}
+    return {"claimed": amount, **wallet_payload(req.conn, req.user["id"])}
+
+
+# What the Frontman says you did for the money. Purely flavour.
+SHIFTS = [
+    "dealt a double shift at the blackjack table",
+    "swept the floor of the slot hall",
+    "counted the chip trays twice, because they didn't add up the first time",
+    "polished the roulette wheel until it squeaked",
+    "talked a high roller out of a very bad idea",
+    "restocked the drinks fridge in the Sana Lounge",
+    "carried the cash box across the floor without dropping it",
+    "sat in for the croupier's break",
+]
+
+# One shift in five ends like this, and ends unpaid.
+MISHAPS = [
+    "reversed the drinks trolley over the boss's cat. The cat is fine. You are not",
+    "lost the float somewhere between the tables and the safe",
+    "waved through a man in a false moustache carrying the chip tray",
+    "tipped a full drinks tray into the roulette wheel",
+    "called last orders four hours early, in front of the boss",
+    "were found asleep in the cash office at half past two",
+    "set off the fire alarm finding out whether it worked. It worked",
+    "dealt an entire shoe face up and only noticed at the end",
+    "let the boss's cat into the count room. It sat on the money",
+]
+
+
+@route("POST", r"/api/wallet/work")
+def api_work(req):
+    """An hourly shift.
+
+    Four times in five it pays; the fifth is a bad day at the office and pays
+    nothing. Either way the hour is on the clock, and every five hours earns a
+    20% rise until the pay tops out.
+    """
+    req.require_auth()
+    perks = db.perks_for(req.conn, req.user["id"])
+    interval = db.work_interval(perks)
+    row = req.conn.execute(
+        "SELECT last_work, work_shifts FROM users WHERE id = ?", (req.user["id"],)
+    ).fetchone()
+    waited = db.now() - row["last_work"]
+    if waited < interval:
+        raise HttpError(429, f"You're on a break. Back in {wait_text(interval - waited)}.")
+
+    shifts = row["work_shifts"]
+    rate = db.work_pay(perks, shifts)
+    went_well = secrets.SystemRandom().random() < db.WORK_SUCCESS
+    earned = rate if went_well else 0
+
+    with req.conn:
+        req.conn.execute(
+            "UPDATE users SET coins = coins + ?, last_work = ?,"
+            " work_shifts = work_shifts + 1 WHERE id = ?",
+            (earned, db.now(), req.user["id"]),
+        )
+    return {
+        "earned": earned,
+        "ok": went_well,
+        "shift": secrets.choice(SHIFTS if went_well else MISHAPS),
+        # A rise lands the moment the fifth hour is done, so the card can say so.
+        "raised": db.work_pay(perks, shifts + 1) > rate,
+        **wallet_payload(req.conn, req.user["id"]),
+    }
+
+
+# ------------------------------------------------------------------ the shop
+
+@route("GET", r"/api/shop")
+def api_shop(req):
+    req.require_auth()
+    owned = db.perks_for(req.conn, req.user["id"])
+    return {
+        "items": [{**item, "owned": item["id"] in owned} for item in db.SHOP_ITEMS],
+        "coins": db.balance(req.conn, req.user["id"]),
+    }
+
+
+@route("POST", r"/api/shop/buy")
+def api_buy(req):
+    """Buy a perk. Permanent, non-refundable, and only ever bought once."""
+    req.require_auth()
+    item = db.SHOP_BY_ID.get(str(req.body.get("item") or "").lower())
+    if not item:
+        raise HttpError(404, "The Frontman doesn't sell that.")
+    if item["id"] in db.perks_for(req.conn, req.user["id"]):
+        raise HttpError(409, f"You already own the {item['name'].lower()}.")
+
+    have = db.balance(req.conn, req.user["id"])
+    if have < item["price"]:
+        short = item["price"] - have
+        raise HttpError(400,
+                        f"That's {item['price']:,} Sana Coin — you're {short:,} short.")
+    with req.conn:
+        # Take the money and record the sale together: a crash between the two
+        # would either charge for nothing or hand out a free perk.
+        req.conn.execute(
+            "UPDATE users SET coins = coins - ? WHERE id = ? AND coins >= ?",
+            (item["price"], req.user["id"], item["price"]),
+        )
+        req.conn.execute(
+            "INSERT INTO purchases (user_id, item, price, created_at) VALUES (?,?,?,?)",
+            (req.user["id"], item["id"], item["price"], db.now()),
+        )
+    if item["id"] == "lounge":
+        # The key is no use without a door: make sure every server they are in
+        # has a lounge to walk into.
+        for r in req.conn.execute(
+            "SELECT guild_id FROM guild_members WHERE user_id = ?", (req.user["id"],)
+        ).fetchall():
+            ensure_lounge(req.conn, r["guild_id"])
+
+    out = {"item": item, "wallet": wallet_payload(req.conn, req.user["id"])}
+    # Bought from a channel: the Frontman announces it there, the way it
+    # announces everything else it is asked to do.
+    channel_id = req.body.get("channelId")
+    if channel_id:
+        channel_access_or_403(req, int(channel_id))
+        me = req.conn.execute(
+            "SELECT * FROM users WHERE id = ?", (req.user["id"],)
+        ).fetchone()
+        card = post_info_card(req, int(channel_id), {
+            "kind": "purchase",
+            "player": public_user(req.conn, me, True),
+            "item": item,
+            "coins": out["wallet"]["coins"],
+        })
+        out["message"] = card["message"]
+    return out
+
+
+def ensure_lounge(conn, guild_id):
+    """Create the server's Sana Lounge channel if it hasn't got one yet."""
+    if not guild_id:
+        return None
+    row = conn.execute(
+        "SELECT id FROM channels WHERE guild_id = ? AND locked = 'lounge'", (guild_id,)
+    ).fetchone()
+    if row:
+        return row["id"]
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO channels (guild_id, kind, name, topic, position, locked,"
+            " created_at) VALUES (?,'text',?,?,?,'lounge',?)",
+            # Pinned to the bottom by a position no drag can reach: reordering
+            # rewrites the visible channels as 0, 1, 2… and skips this one.
+            (guild_id, db.LOUNGE_CHANNEL, "Members only. Bought, not given.",
+             LOUNGE_POSITION, db.now()),
+        )
+    return cur.lastrowid
+
+
+LOUNGE_POSITION = 9999
 
 
 @route("GET", r"/api/guilds/(\d+)/bank")
@@ -1867,6 +2315,7 @@ def api_bank(req, guild_id):
         " ORDER BY u.coins DESC, u.username COLLATE NOCASE",
         (guild_id,),
     ).fetchall()
+    perks = db.perks_map(req.conn, [r["id"] for r in rows])
     return {
         "accounts": [
             {
@@ -1874,6 +2323,7 @@ def api_bank(req, guild_id):
                 "username": r["username"],
                 "color": r["color"],
                 "avatarUrl": db.avatar_url(r),
+                "perks": sorted(perks.get(r["id"], ())),
                 "coins": r["coins"],
                 "rank": db.rank_for(r["wins"]),
             }
@@ -1881,6 +2331,43 @@ def api_bank(req, guild_id):
         ],
         "total": sum(r["coins"] for r in rows),
     }
+
+
+@route("POST", r"/api/guilds/(\d+)/reset")
+def api_reset_economy(req, guild_id):
+    """Wipe balances and records back to day one, for this server's members.
+
+    Sana Coin and game stats are per-account rather than per-server, so this
+    reaches every table that person plays at. That is the honest reading of
+    "reset the leaderboard" — a score you keep somewhere else isn't reset —
+    and the confirmation dialog says so before anything happens.
+
+    Perks bought from the shop are left alone: they were paid for, and a reset
+    is meant to level the scoreboard, not confiscate.
+    """
+    req.require_auth()
+    guild_id = int(guild_id)
+    owner_only(req, guild_id)
+
+    members = [
+        r["user_id"]
+        for r in req.conn.execute(
+            "SELECT m.user_id FROM guild_members m JOIN users u ON u.id = m.user_id"
+            " WHERE m.guild_id = ? AND u.is_bot = 0",
+            (guild_id,),
+        )
+    ]
+    if not members:
+        return {"reset": 0}
+    marks = ",".join("?" * len(members))
+    with req.conn:
+        req.conn.execute(
+            f"UPDATE users SET coins = ?, last_claim = 0, last_work = 0"
+            f" WHERE id IN ({marks})",
+            [db.STARTING_COINS] + members,
+        )
+        req.conn.execute(f"DELETE FROM game_stats WHERE user_id IN ({marks})", members)
+    return {"reset": len(members), "startingCoins": db.STARTING_COINS}
 
 
 @route("GET", r"/api/guilds/(\d+)/leaderboard")
@@ -1898,6 +2385,7 @@ def api_leaderboard(req, guild_id):
         " ORDER BY wins DESC, net DESC, u.username COLLATE NOCASE LIMIT 25",
         (guild_id,),
     ).fetchall()
+    perks = db.perks_map(req.conn, [r["id"] for r in rows])
     return {
         "players": [
             {
@@ -1905,6 +2393,7 @@ def api_leaderboard(req, guild_id):
                 "username": r["username"],
                 "color": r["color"],
                 "avatarUrl": f"/uploads/{r['avatar']}" if r["avatar"] else None,
+                "perks": sorted(perks.get(r["id"], ())),
                 "wins": r["wins"],
                 "losses": r["losses"],
                 "net": r["net"],
@@ -1929,6 +2418,24 @@ def serialize_game(conn, row, viewer_id):
     if mode == "poker":
         return serialize_poker(conn, row, viewer_id)
 
+    if mode == "roulette":
+        host = conn.execute("SELECT * FROM users WHERE id = ?", (row["host_id"],)).fetchone()
+        return {
+            "id": row["id"],
+            "mode": "roulette",
+            "status": "finished",
+            "bet": row["bet"],
+            "number": state["number"],
+            "colour": state["colour"],
+            "betLabel": state["betLabel"],
+            "pays": state["pays"],
+            "payout": state["payout"],
+            "profit": state["profit"],
+            "label": state["label"],
+            "player": public_user(conn, host) if host else None,
+            "yourSeat": "host" if viewer_id == row["host_id"] else None,
+        }
+
     if mode == "slots":
         host = conn.execute("SELECT * FROM users WHERE id = ?", (row["host_id"],)).fetchone()
         return {
@@ -1940,7 +2447,7 @@ def serialize_game(conn, row, viewer_id):
             "label": state["label"],
             "payout": state["payout"],
             "profit": state["profit"],
-            "player": db.public_user(host, db.is_online(host)) if host else None,
+            "player": public_user(conn, host) if host else None,
             "yourSeat": "host" if viewer_id == row["host_id"] else None,
         }
 
@@ -1956,7 +2463,7 @@ def serialize_game(conn, row, viewer_id):
     for seat, uid in (("host", row["host_id"]), ("opp", row["guest_id"])):
         if uid:
             u = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-            people[seat] = db.public_user(u, db.is_online(u)) if u else None
+            people[seat] = public_user(conn, u) if u else None
         else:
             people[seat] = None
     if mode == "cpu":
@@ -1981,6 +2488,25 @@ def serialize_game(conn, row, viewer_id):
             "stood": state["stood"][seat],
         }
 
+    if mode == "cpu":
+        # The player's side is a list: doubling and splitting can turn one
+        # hand into as many as four, each with its own stake and outcome.
+        hands = blackjack.player_hands(state)
+        outcomes = state.get("results") or []
+        seats["host"]["hands"] = [
+            {
+                "cards": hand["cards"],
+                "total": blackjack.hand_value(hand["cards"]),
+                "busted": blackjack.is_bust(hand["cards"]),
+                "stood": hand["stood"],
+                "doubled": hand["doubled"],
+                "stake": row["bet"] * hand.get("bet", 1),
+                "active": index == state.get("active", 0) and status == "playing",
+                "result": outcomes[index] if index < len(outcomes) else None,
+            }
+            for index, hand in enumerate(hands)
+        ]
+
     result = state.get("result")
     outcome = None
     if result:
@@ -2002,6 +2528,10 @@ def serialize_game(conn, row, viewer_id):
         "yourSeat": viewer_seat,
         "yourTurn": viewer_seat is not None and state.get("turn") == viewer_seat
                     and status == "playing",
+        "canDouble": (mode == "cpu" and viewer_seat == "host" and status == "playing"
+                      and blackjack.can_double(state)),
+        "canSplit": (mode == "cpu" and viewer_seat == "host" and status == "playing"
+                     and blackjack.can_split(state)),
         "canJoin": status == "waiting" and viewer_id != row["host_id"],
         "result": result,
         "outcome": outcome,
@@ -2037,22 +2567,32 @@ def settle_bets(conn, row, state):
         return
     bet, mode = row["bet"], row["mode"]
     winner = state["result"]["winner"]
-    natural = blackjack.is_natural(state["hands"]["host"])
 
     with conn:
         conn.execute("UPDATE games SET settled = 1 WHERE id = ?", (row["id"],))
 
         if mode == "cpu":
-            # Blackjack pays 3:2, an ordinary win pays even money.
-            if winner == "host":
-                gross = int(bet * 2.5) if natural else bet * 2
-            elif winner == "push":
-                gross = bet
-            else:
-                gross = 0
+            # Every hand is paid separately — a split can win one and lose the
+            # other — and each carries its own stake once doubled.
+            hands = blackjack.player_hands(state)
+            results = state.get("results") or [state["result"]]
+            gross = staked = 0
+            for hand, result in zip(hands, results):
+                stake = bet * hand.get("bet", 1)
+                staked += stake
+                if result["winner"] == "push":
+                    gross += stake
+                elif result["winner"] == "host":
+                    # Blackjack pays 3:2, an ordinary win pays even money. A 21
+                    # made out of a split is not a blackjack, as at any table.
+                    natural = (len(hands) == 1 and not state.get("split")
+                               and blackjack.is_natural(hand["cards"]))
+                    gross += int(stake * 2.5) if natural else stake * 2
             db.adjust_coins(conn, row["host_id"], gross)
+            # The record follows the cards, not the money: a for-fun hand
+            # stakes nothing but still counts as a win towards your rank.
             outcome = {"host": "win", "push": "push"}.get(winner, "lose")
-            db.record_result(conn, row["host_id"], outcome, gross - bet, bet)
+            db.record_result(conn, row["host_id"], outcome, gross - staked, staked)
             return
 
         # pvp: both staked, so the winner takes the pot.
@@ -2167,7 +2707,7 @@ def serialize_poker(conn, row, viewer_id):
             continue
         u = conn.execute("SELECT * FROM users WHERE id = ?", (p["userId"],)).fetchone()
         if u:
-            people[p["userId"]] = db.public_user(u, db.is_online(u))
+            people[p["userId"]] = public_user(conn, u)
 
     done = state["stage"] == "showdown"
     seats = []
@@ -2186,6 +2726,7 @@ def serialize_poker(conn, row, viewer_id):
             "folded": p["folded"],
             "acted": p["acted"],
             "contributed": p["contributed"],
+            "street": p.get("street", 0),
             "isYou": mine,
         }
         if done and state["result"]:
@@ -2196,6 +2737,7 @@ def serialize_poker(conn, row, viewer_id):
         seats.append(entry)
 
     me = poker.seat(state, viewer_id)
+    ante = state["ante"]
     return {
         "id": row["id"],
         "mode": "poker",
@@ -2203,8 +2745,13 @@ def serialize_poker(conn, row, viewer_id):
         "stage": state["stage"],
         "board": state["board"],
         "pot": state["pot"],
-        "ante": state["ante"],
-        "bet": state["ante"],
+        "ante": ante,
+        "bet": ante,
+        "toMatch": state.get("toMatch", 0),
+        # What this viewer must put in to keep playing: 0 means they can check.
+        "toCall": poker.owed(state, me) if me else 0,
+        "minRaise": ante,
+        "maxRaise": ante * poker.MAX_RAISE_MULTIPLE,
         "seats": seats,
         "hostId": row["host_id"],
         "isHost": viewer_id == row["host_id"],
@@ -2220,7 +2767,7 @@ def serialize_poker(conn, row, viewer_id):
 
 
 def post_info_card(req, channel_id, payload):
-    """Persist a Gamesman info card and post it as a bot message.
+    """Persist a Frontman info card and post it as a bot message.
 
     Reusing the games row keeps the card in channel history, the way a real
     bot embed stays where it was posted.
@@ -2239,9 +2786,9 @@ def post_info_card(req, channel_id, payload):
             "wallet": wallet_payload(req.conn, req.user["id"])}
 
 
-@route("POST", r"/api/channels/(\d+)/gamesman")
-def api_gamesman_card(req, channel_id):
-    """The Gamesman answers /claim, /balance, /bank and /leaderboard in-channel."""
+@route("POST", r"/api/channels/(\d+)/frontman")
+def api_frontman_card(req, channel_id):
+    """The Frontman answers /claim, /balance, /bank and /leaderboard in-channel."""
     req.require_auth()
     channel_id = int(channel_id)
     ch = channel_access_or_403(req, channel_id)
@@ -2254,7 +2801,7 @@ def api_gamesman_card(req, channel_id):
         ).fetchone()
         return post_info_card(req, channel_id, {
             "kind": "claim",
-            "player": db.public_user(me, True),
+            "player": public_user(req.conn, me, True),
             "claimed": result["claimed"],
             "coins": result["coins"],
             "stats": result["stats"],
@@ -2267,11 +2814,47 @@ def api_gamesman_card(req, channel_id):
         ).fetchone()
         return post_info_card(req, channel_id, {
             "kind": "balance",
-            "player": db.public_user(me, True),
+            "player": public_user(req.conn, me, True),
             "coins": w["coins"],
             "canClaim": w["canClaim"],
             "claimIn": w["claimIn"],
             "stats": w["stats"],
+        })
+
+    if kind == "work":
+        result = api_work(req)
+        me = req.conn.execute(
+            "SELECT * FROM users WHERE id = ?", (req.user["id"],)
+        ).fetchone()
+        return post_info_card(req, channel_id, {
+            "kind": "work",
+            "player": public_user(req.conn, me, True),
+            "earned": result["earned"],
+            "ok": result["ok"],
+            "raised": result["raised"],
+            "shift": result["shift"],
+            "coins": result["coins"],
+            "workIn": result["workIn"],
+            "workPay": result["workPay"],
+            "workShifts": result["workShifts"],
+            "shiftsToRaise": result["shiftsToRaise"],
+            "stats": result["stats"],
+        })
+
+    if kind == "reset":
+        if ch["kind"] != "text":
+            raise HttpError(400, "/reset needs a server channel.")
+        guild = owner_only(req, ch["guild_id"])
+        data = api_reset_economy(req, ch["guild_id"])
+        me = req.conn.execute(
+            "SELECT * FROM users WHERE id = ?", (req.user["id"],)
+        ).fetchone()
+        return post_info_card(req, channel_id, {
+            "kind": "reset",
+            "player": public_user(req.conn, me, True),
+            "guild": guild["name"],
+            "count": data["reset"],
+            "startingCoins": data.get("startingCoins", db.STARTING_COINS),
         })
 
     if kind in ("bank", "leaderboard"):
@@ -2281,7 +2864,7 @@ def api_gamesman_card(req, channel_id):
                 else api_leaderboard(req, ch["guild_id"]))
         return post_info_card(req, channel_id, {"kind": kind, **data})
 
-    raise HttpError(400, "Unknown Gamesman card.")
+    raise HttpError(400, "Unknown Frontman card.")
 
 
 @route("POST", r"/api/channels/(\d+)/poker")
@@ -2411,6 +2994,22 @@ def api_poker_deal(req, game_id):
     return save_poker(req, row, state, "playing")
 
 
+def raise_amount(req, state):
+    """How much a raise puts on top of the call, in whole antes."""
+    ante = state["ante"] or 1
+    raw = req.body.get("raise")
+    amount = int(raw) if raw else ante
+    if amount <= 0:
+        raise HttpError(400, "A raise has to be more than nothing.")
+    if amount % ante:
+        raise HttpError(400, f"Raise in multiples of the {ante:,} ante.")
+    if amount > ante * poker.MAX_RAISE_MULTIPLE:
+        raise HttpError(
+            400, f"The most you can raise at once is {ante * poker.MAX_RAISE_MULTIPLE:,}."
+        )
+    return amount
+
+
 @route("POST", r"/api/games/(\d+)/poker/action")
 def api_poker_action(req, game_id):
     req.require_auth()
@@ -2418,8 +3017,12 @@ def api_poker_action(req, game_id):
     if row["mode"] != "poker":
         raise HttpError(400, "That isn't a poker table.")
     action = (req.body.get("action") or "").lower()
-    if action not in ("stay", "fold"):
-        raise HttpError(400, "Action must be 'stay' or 'fold'.")
+    # 'stay' is the old name for the free-to-continue action; it still arrives
+    # from cards posted before betting existed, and means the same thing.
+    if action == "stay":
+        action = "call"
+    if action not in ("check", "call", "raise", "fold"):
+        raise HttpError(400, "Action must be 'check', 'call', 'raise' or 'fold'.")
 
     state = json.loads(row["state"])
     me = poker.seat(state, req.user["id"])
@@ -2430,14 +3033,24 @@ def api_poker_action(req, game_id):
     if me["folded"] or me["acted"]:
         raise HttpError(409, "You've already acted this round.")
 
-    if action == "stay":
-        if db.balance(req.conn, req.user["id"]) < state["ante"]:
-            raise HttpError(400, "You can't cover the next round — fold instead.")
-        with req.conn:
-            db.adjust_coins(req.conn, req.user["id"], -state["ante"])
-        poker.stay(state, req.user["id"])
-    else:
+    price = poker.owed(state, me)
+    if action == "check" and price:
+        raise HttpError(400, f"There's {price:,} to call — call, raise or fold.")
+
+    if action == "fold":
         poker.fold(state, req.user["id"])
+    else:
+        extra = 0
+        if action == "raise":
+            extra = raise_amount(req, state)
+        cost = price + extra
+        if cost > db.balance(req.conn, req.user["id"]):
+            raise HttpError(400, f"That costs {cost:,} Sana Coin and you can't cover it.")
+        spent = (poker.raise_to(state, req.user["id"], extra) if action == "raise"
+                 else poker.stay(state, req.user["id"]))
+        if spent:
+            with req.conn:
+                db.adjust_coins(req.conn, req.user["id"], -spent)
 
     if poker.hand_over(state) or poker.round_complete(state):
         poker.advance(state)
@@ -2490,6 +3103,61 @@ def api_slots(req, channel_id):
             "wallet": wallet_payload(req.conn, req.user["id"])}
 
 
+@route("POST", r"/api/channels/(\d+)/roulette")
+def api_roulette(req, channel_id):
+    """One spin of the wheel, posted by the bot."""
+    req.require_auth()
+    channel_id = int(channel_id)
+    channel_access_or_403(req, channel_id)
+
+    kind = (req.body.get("kind") or "").lower()
+    pick = req.body.get("number")
+    try:
+        pick = int(pick) if pick is not None and pick != "" else None
+    except (TypeError, ValueError):
+        raise HttpError(400, "Pick a number between 0 and 36.")
+    if not roulette.valid(kind, pick):
+        raise HttpError(400, "Pick a bet from the table, or a number from 0 to 36.")
+
+    bet = take_bet(req, req.body.get("bet"))
+    if bet < 10:
+        # Refund the stake we just held before rejecting.
+        if bet:
+            with req.conn:
+                db.adjust_coins(req.conn, req.user["id"], bet)
+        raise HttpError(400, "Minimum spin is 10 Sana Coin.")
+
+    result = roulette.play(kind, bet, pick)
+    state = {
+        "kind": "roulette",
+        "number": result["number"],
+        "colour": result["colour"],
+        "betLabel": result["bet"],
+        "pays": result["pays"],
+        "payout": result["payout"],
+        "profit": result["profit"],
+        "label": result["label"],
+        "result": {"winner": "host" if result["won"] else "opp",
+                   "text": result["label"]},
+    }
+    now = db.now()
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO games (channel_id, mode, status, host_id, state, bet,"
+            " settled, created_at, updated_at) VALUES (?,?,?,?,?,?,1,?,?)",
+            (channel_id, "roulette", "finished", req.user["id"], json.dumps(state),
+             bet, now, now),
+        )
+        db.adjust_coins(req.conn, req.user["id"], result["payout"])
+        db.record_result(req.conn, req.user["id"], "win" if result["won"] else "lose",
+                         result["profit"], bet)
+
+    msg_id = post_game_message(req, channel_id, cur.lastrowid)
+    mark_read(req.conn, req.user["id"], channel_id, msg_id)
+    return {"message": serialize_one(req.conn, msg_id, req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
+
+
 @route("POST", r"/api/games/(\d+)/join")
 def api_join_game(req, game_id):
     req.require_auth()
@@ -2534,8 +3202,8 @@ def api_game_action(req, game_id):
     req.require_auth()
     row = load_game(req, game_id)
     action = (req.body.get("action") or "").lower()
-    if action not in ("hit", "stand"):
-        raise HttpError(400, "Action must be 'hit' or 'stand'.")
+    if action not in ("hit", "stand", "double", "split"):
+        raise HttpError(400, "Action must be 'hit', 'stand', 'double' or 'split'.")
     if row["status"] != "playing":
         raise HttpError(409, "That hand isn't in play.")
 
@@ -2548,7 +3216,27 @@ def api_game_action(req, game_id):
     if not blackjack.can_act(state, seat):
         raise HttpError(409, "It isn't your turn.")
 
-    if action == "hit":
+    if action in ("double", "split"):
+        # Both put a second stake on the table, so both need covering first.
+        if row["mode"] != "cpu":
+            raise HttpError(400, "Doubling and splitting are for hands against the dealer.")
+        allowed = (blackjack.can_double(state) if action == "double"
+                   else blackjack.can_split(state))
+        if not allowed:
+            raise HttpError(409, "You can't do that with this hand.")
+        extra = row["bet"] * blackjack.current_hand(state)["bet"] if action == "double" \
+            else row["bet"]
+        if extra:
+            have = db.balance(req.conn, req.user["id"])
+            if extra > have:
+                raise HttpError(400, f"That needs another {extra:,} and you have {have:,}.")
+            with req.conn:
+                db.adjust_coins(req.conn, req.user["id"], -extra)
+        if action == "double":
+            blackjack.double(state)
+        else:
+            blackjack.split(state)
+    elif action == "hit":
         blackjack.hit(state, seat, row["mode"])
     else:
         blackjack.stand(state, seat, row["mode"])
@@ -2578,7 +3266,7 @@ def api_mentionable(req, channel_id):
         ).fetchall()
     # Bots are left out: pinging one does nothing, so suggesting it is noise.
     return {
-        "users": [db.public_user(r, db.is_online(r)) for r in rows],
+        "users": [public_user(req.conn, r) for r in rows],
         "everyone": ch["kind"] != "dm",
     }
 
@@ -2595,7 +3283,7 @@ def api_channel_info(req, channel_id):
                 "id": ch["id"],
                 "kind": "dm",
                 "name": other["username"] if other else "Unknown",
-                "user": db.public_user(other, db.is_online(other)) if other else None,
+                "user": public_user(req.conn, other) if other else None,
             }
         }
     return {
@@ -2667,7 +3355,7 @@ def api_user_profile(req, user_id):
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (int(user_id),)).fetchone()
     if not row:
         raise HttpError(404, "User not found.")
-    payload = db.public_user(row, db.is_online(row))
+    payload = public_user(req.conn, row)
     payload["createdAt"] = row["created_at"]
     f = req.conn.execute(
         "SELECT * FROM friendships WHERE (requester_id = ? AND addressee_id = ?)"

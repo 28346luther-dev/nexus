@@ -118,7 +118,26 @@ function avatar(user, size = '') {
     node.style.background = user.color || '#5865f2';
   }
   if (user.online !== undefined) node.dataset.status = user.online ? 'online' : 'offline';
+  if (hasPerk(user, 'ring')) node.classList.add('ringed');
   return node;
+}
+
+function hasPerk(user, id) {
+  return !!(user && user.perks && user.perks.includes(id));
+}
+
+/** A username, plus whatever the shop has bolted onto it. */
+function nameNode(user, cls = '') {
+  const wrap = el('span', `name ${cls}`.trim());
+  const text = el('span', 'name-text', user ? (user.username || user.name) : '—');
+  if (hasPerk(user, 'glow')) text.classList.add('glow');
+  wrap.appendChild(text);
+  if (hasPerk(user, 'badge')) {
+    const vip = el('span', 'vip-tag', 'VIP');
+    vip.title = 'VIP — bought from the Frontman shop';
+    wrap.appendChild(vip);
+  }
+  return wrap;
 }
 
 const DAY_MS = 86400000;
@@ -268,8 +287,10 @@ function renderRail() {
       btn.textContent = guildInitials(g.name);
     }
     btn.classList.toggle('active', state.activeGuildId === g.id);
-    const unread = g.channels.reduce((n, c) => n + c.unread, 0);
-    const pings = g.channels.reduce((n, c) => n + (c.mentions || 0), 0);
+    // Muted channels are deliberately invisible from out here too.
+    const loud = g.channels.filter((c) => !c.muted);
+    const unread = loud.reduce((n, c) => n + c.unread, 0);
+    const pings = loud.reduce((n, c) => n + (c.mentions || 0), 0);
     if (pings > 0) {
       const b = el('span', 'rail-badge ping', pings > 99 ? '99+' : `@${pings}`);
       b.title = `${pings} message${pings === 1 ? '' : 's'} mentioning you`;
@@ -314,24 +335,37 @@ function renderSidebar() {
     guild.channels.forEach((c) => {
       const item = el('button', 'side-item');
       item.dataset.channelId = String(c.id);
-      if (guild.isOwner) {
+      // The lounge is bought, not arranged: leave it pinned at the bottom.
+      if (guild.isOwner && !c.locked) {
         item.draggable = true;
         item.classList.add('draggable');
         item.title = 'Drag to reorder';
       }
       item.classList.toggle('active', c.id === state.activeChannelId);
-      if (c.unread > 0) item.classList.add('unread');
-      item.appendChild(el('span', 'hash', '#'));
+      if (c.unread > 0 && !c.muted) item.classList.add('unread');
+      if (c.muted) item.classList.add('muted');
+      item.appendChild(el('span', 'hash', c.locked ? '🔒' : '#'));
       item.appendChild(el('span', 'label', c.name));
-      if (c.mentions > 0 && c.id !== state.activeChannelId) {
+      // A muted channel keeps its unread count; it just stops shouting it.
+      if (!c.muted && c.mentions > 0 && c.id !== state.activeChannelId) {
         const ping = el('span', 'badge ping', c.mentions > 99 ? '99+' : `@${c.mentions}`);
         ping.title = `${c.mentions} message${c.mentions === 1 ? '' : 's'} mentioning you`;
         item.appendChild(ping);
-      } else if (c.unread > 0 && c.id !== state.activeChannelId) {
+      } else if (!c.muted && c.unread > 0 && c.id !== state.activeChannelId) {
         item.appendChild(el('span', 'badge', c.unread > 99 ? '99+' : String(c.unread)));
       }
       item.onclick = () => openChannel(c.id);
-      if (guild.isOwner && guild.channels.length > 1) {
+
+      const mute = el('span', `mute-btn ${c.muted ? 'on' : ''}`.trim(),
+        c.muted ? '🔕' : '🔔');
+      mute.title = c.muted ? `Unmute #${c.name}` : `Mute #${c.name}`;
+      mute.onclick = (e) => {
+        e.stopPropagation();
+        toggleMute(c);
+      };
+      item.appendChild(mute);
+
+      if (guild.isOwner && guild.channels.length > 1 && !c.locked) {
         const x = el('span', 'x', '×');
         x.title = 'Delete channel';
         x.onclick = (e) => {
@@ -393,6 +427,23 @@ function renderSidebar() {
     item.onclick = () => openChannel(d.channelId);
     body.appendChild(item);
   });
+}
+
+/** Silence or unsilence a channel, redrawing straight away. */
+async function toggleMute(channel) {
+  const wanted = !channel.muted;
+  channel.muted = wanted;                    // optimistic: the click feels instant
+  renderSidebar();
+  renderRail();
+  try {
+    const data = await api('POST', `/api/channels/${channel.id}/mute`, { muted: wanted });
+    channel.muted = data.muted;
+  } catch (err) {
+    toast(err.message, 'error');
+    channel.muted = !wanted;
+  }
+  renderSidebar();
+  renderRail();
 }
 
 /** Let the owner drag channels into a new order in the sidebar. */
@@ -495,7 +546,7 @@ async function renderMembers() {
     // Name and status stack, so a status never widens the row.
     const text = el('div', 'm-text');
     const line = el('div', 'm-line');
-    line.appendChild(el('span', 'm-name', m.username));
+    line.appendChild(nameNode(m, 'm-name'));
     if (m.isBot) line.appendChild(el('span', 'bot-tag', 'BOT'));
     if (m.isOwner) {
       const crown = el('span', 'crown', '♛');
@@ -519,6 +570,9 @@ async function renderMembers() {
 function renderMessages() {
   const box = $('#messages');
   const wasAtBottom = state.atBottom;
+  // The reactor card lives on <body>, so a redraw would strand it pointing at
+  // a pill that no longer exists.
+  hideReactors();
   box.replaceChildren();
 
   if (!state.messages.length) {
@@ -543,8 +597,8 @@ function renderMessages() {
 }
 
 function messageNode(m, grouped) {
-  // Replies and game cards always show their own header.
-  if (m.replyToId || m.game) grouped = false;
+  // Replies, game cards and polls always show their own header.
+  if (m.replyToId || m.game || m.poll) grouped = false;
   const node = el('div', `msg ${grouped ? 'grouped' : ''}`.trim());
   node.dataset.id = m.id;
   if (m.mentionsMe) node.classList.add('pinged');
@@ -562,7 +616,7 @@ function messageNode(m, grouped) {
   const body = el('div', 'msg-body');
   if (!grouped) {
     const head = el('div', 'msg-head');
-    const author = el('span', 'msg-author', m.author.username);
+    const author = nameNode(m.author, 'msg-author');
     author.style.color = m.author.color;
     author.onclick = () => showProfile(m.author.id);
     head.appendChild(author);
@@ -582,6 +636,7 @@ function messageNode(m, grouped) {
   if (gifUrl) body.appendChild(gifNode(gifUrl));
 
   if (m.game) body.appendChild(gameNode(m));
+  if (m.poll) body.appendChild(pollNode(m));
   if (m.sticker) body.appendChild(stickerNode(m.sticker));
   (m.attachments || []).forEach((a) => body.appendChild(attachmentNode(a)));
   if (m.reactions && m.reactions.length) body.appendChild(reactionBar(m));
@@ -720,25 +775,65 @@ function cardNode(card) {
 
 function seatRow(seat, label, isTurn) {
   const wrap = el('div', `seat ${isTurn ? 'active' : ''}`.trim());
+  const split = !!(seat.hands && seat.hands.length > 1);
 
   const head = el('div', 'seat-head');
   if (seat.user) head.appendChild(avatar({ ...seat.user, online: undefined }, 'xs'));
-  head.appendChild(el('span', 'seat-name', seat.user ? seat.user.username : label));
-  if (seat.total !== null) {
+  head.appendChild(seat.user ? nameNode(seat.user, 'seat-name')
+                             : el('span', 'seat-name', label));
+  // A split seat has no single total — each hand carries its own.
+  if (split) {
+    head.appendChild(el('span', 'seat-flag', `${seat.hands.length} HANDS`));
+  } else if (seat.total !== null) {
     const total = el('span', 'seat-total', String(seat.total));
     if (seat.busted) total.classList.add('bust');
     head.appendChild(total);
   } else {
     head.appendChild(el('span', 'seat-total hidden-total', '?'));
   }
-  if (seat.busted) head.appendChild(el('span', 'seat-flag bust-flag', 'BUST'));
-  else if (seat.stood) head.appendChild(el('span', 'seat-flag', 'STAND'));
+  if (!split && seat.busted) head.appendChild(el('span', 'seat-flag bust-flag', 'BUST'));
+  else if (!split && seat.stood) head.appendChild(el('span', 'seat-flag', 'STAND'));
   wrap.appendChild(head);
+
+  // One row per hand once a split is in play; a lone hand needs no label.
+  if (split) {
+    seat.hands.forEach((h, i) => wrap.appendChild(splitHandNode(h, i)));
+    return wrap;
+  }
 
   const hand = el('div', 'hand');
   seat.cards.forEach((c) => hand.appendChild(cardNode(c)));
   wrap.appendChild(hand);
+  if (seat.hands && seat.hands[0] && seat.hands[0].doubled) {
+    wrap.appendChild(el('span', 'seat-flag', 'DOUBLED'));
+  }
   return wrap;
+}
+
+const SPLIT_OUTCOME = { host: 'won', opp: 'lost', push: 'push' };
+
+function splitHandNode(h, index) {
+  const box = el('div', `split-hand ${h.active ? 'active' : ''}`.trim());
+
+  const head = el('div', 'split-head');
+  head.appendChild(el('span', 'split-label', `Hand ${index + 1}`));
+  const total = el('span', 'seat-total', String(h.total));
+  if (h.busted) total.classList.add('bust');
+  head.appendChild(total);
+  if (h.doubled) head.appendChild(el('span', 'seat-flag', 'DOUBLED'));
+  else if (h.busted) head.appendChild(el('span', 'seat-flag bust-flag', 'BUST'));
+  else if (h.stood) head.appendChild(el('span', 'seat-flag', 'STAND'));
+  if (h.result) {
+    const word = SPLIT_OUTCOME[h.result.winner] || '';
+    head.appendChild(el('span', `split-outcome ${h.result.winner}`, word));
+  }
+  if (h.stake) head.appendChild(el('span', 'split-stake', coins(h.stake)));
+  box.appendChild(head);
+
+  const hand = el('div', 'hand');
+  h.cards.forEach((c) => hand.appendChild(cardNode(c)));
+  box.appendChild(hand);
+  return box;
 }
 
 function slotsNode(g) {
@@ -788,8 +883,9 @@ function pokerNode(g) {
   const head = el('div', 'game-head');
   head.appendChild(el('span', 'game-title', "Poker · Hold'em"));
   if (g.ante) head.appendChild(el('span', 'game-stake', coins(g.ante)));
+  const status = `${STAGE_LABEL[g.stage]} · pot ${g.pot.toLocaleString()} ${COIN}`;
   head.appendChild(el('span', 'game-status',
-    `${STAGE_LABEL[g.stage]} · pot ${g.pot.toLocaleString()} ${COIN}`));
+    g.toMatch ? `${status} · ${g.toMatch.toLocaleString()} to match` : status));
   card.appendChild(head);
 
   if (g.board.length) {
@@ -807,7 +903,7 @@ function pokerNode(g) {
 
     const who = el('div', 'poker-who');
     if (s.user) who.appendChild(avatar({ ...s.user, online: undefined }, 'xs'));
-    who.appendChild(el('span', 'poker-name', s.user ? s.user.username : '—'));
+    who.appendChild(nameNode(s.user, 'poker-name'));
     if (s.folded) who.appendChild(el('span', 'seat-flag', 'FOLD'));
     else if (s.acted && g.stage !== 'showdown') who.appendChild(el('span', 'seat-flag', 'IN'));
     if (s.won) who.appendChild(el('span', 'seat-flag win-flag', 'WON'));
@@ -816,6 +912,11 @@ function pokerNode(g) {
     const hand = el('div', 'poker-hole');
     s.hole.forEach((c) => hand.appendChild(cardNode(c)));
     row.appendChild(hand);
+
+    // What they have put in this street, so a raise is visible around the table.
+    if (s.street > 0 && g.stage !== 'showdown') {
+      row.appendChild(el('span', 'poker-chips', `${s.street.toLocaleString()} ${COIN}`));
+    }
 
     if (s.hand) row.appendChild(el('span', 'poker-hand-name', s.hand.name));
     seats.appendChild(row);
@@ -845,11 +946,19 @@ function pokerNode(g) {
     actions.appendChild(deal);
   }
   if (g.yourTurn) {
-    const stay = el('button', 'btn primary small', `Stay (${coins(g.ante)})`);
-    stay.onclick = () => pokerCall(g.id, 'action', { action: 'stay' });
+    // Checking is free, so it is the safe default when nothing is owed; when
+    // there is, the same slot becomes Call and says what it costs.
+    const stay = el('button', 'btn primary small',
+      g.toCall ? `Call ${coins(g.toCall)}` : 'Check');
+    stay.onclick = () => pokerCall(g.id, 'action',
+      { action: g.toCall ? 'call' : 'check' });
+
+    const raise = el('button', 'btn small', 'Raise');
+    raise.onclick = () => askRaise(g);
+
     const fold = el('button', 'btn small', 'Fold');
     fold.onclick = () => pokerCall(g.id, 'action', { action: 'fold' });
-    actions.append(stay, fold);
+    actions.append(stay, raise, fold);
   }
   if (g.stage === 'showdown' && g.youArePlaying) {
     const bots = g.seats.filter((s) => s.user && s.user.isBot).length;
@@ -865,6 +974,137 @@ function pokerNode(g) {
   return card;
 }
 
+/** "How much on top?" — raises are whole antes, so offer them as buttons. */
+function askRaise(g) {
+  const steps = [];
+  for (let n = g.minRaise; n <= g.maxRaise && steps.length < 6; n *= 2) steps.push(n);
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Raise'));
+    box.appendChild(el('p', 'sub', g.toCall
+      ? `${coins(g.toCall)} to call. Anything you add on top is the raise, and `
+        + 'everyone still in has to answer it.'
+      : 'Nothing to call. Whatever you put in becomes the price for everyone else.'));
+
+    const form = el('form');
+    const label = el('label', 'field');
+    label.appendChild(el('span', null, 'Raise by'));
+    const field = el('input');
+    field.type = 'number';
+    field.min = String(g.minRaise);
+    field.max = String(g.maxRaise);
+    field.step = String(g.minRaise);
+    field.value = String(g.minRaise);
+    label.appendChild(field);
+    const total = el('small');
+    const paint = () => {
+      const n = parseInt(field.value, 10) || 0;
+      total.textContent = `Costs you ${coins(g.toCall + n)} in total.`;
+    };
+    field.oninput = paint;
+    paint();
+    label.appendChild(total);
+    form.appendChild(label);
+
+    const quick = el('div', 'stake-quick');
+    steps.forEach((n) => {
+      const b = el('button', 'btn small ghost', n.toLocaleString());
+      b.type = 'button';
+      b.onclick = () => { field.value = String(n); paint(); };
+      quick.appendChild(b);
+    });
+    form.appendChild(quick);
+
+    const actions = el('div', 'modal-actions');
+    const cancel = el('button', 'btn ghost', 'Cancel');
+    cancel.type = 'button';
+    cancel.onclick = close;
+    const go = el('button', 'btn primary', 'Raise');
+    actions.append(cancel, go);
+    form.appendChild(actions);
+
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      const n = parseInt(field.value, 10);
+      if (Number.isNaN(n) || n < g.minRaise) {
+        toast(`The smallest raise is ${coins(g.minRaise)}.`, 'error');
+        return;
+      }
+      close();
+      pokerCall(g.id, 'action', { action: 'raise', raise: n });
+    };
+    box.appendChild(form);
+  });
+}
+
+function purchaseCard(card, g) {
+  const top = el('div', 'wallet-top');
+  if (g.player) top.appendChild(avatar({ ...g.player, online: undefined }, 'lg'));
+  const meta = el('div');
+  meta.appendChild(nameNode(g.player, 'wallet-name'));
+  meta.appendChild(el('div', 'muted', `now holding ${coins(g.coins)}`));
+  top.appendChild(meta);
+  card.appendChild(top);
+
+  const banner = el('div', 'game-result win');
+  banner.appendChild(el('strong', null, `${g.item.icon} ${g.item.name}`));
+  banner.appendChild(el('span', null,
+    `${g.item.summary} Paid ${coins(g.item.price)}.`));
+  card.appendChild(banner);
+  card.appendChild(el('div', 'game-foot', 'Bought from the Frontman shop — /shop'));
+  return card;
+}
+
+function resetCard(card, g) {
+  const banner = el('div', 'game-result lose');
+  banner.appendChild(el('strong', null, 'Everything back to zero'));
+  banner.appendChild(el('span', null,
+    `${g.count} ${g.count === 1 ? 'account' : 'accounts'} in ${g.guild} reset to `
+    + `${coins(g.startingCoins)}. Wins, losses and streaks wiped.`));
+  card.appendChild(banner);
+  card.appendChild(el('div', 'game-foot',
+    `Called by ${g.player ? g.player.username : 'the owner'}. Perks bought from `
+    + 'the shop were left alone.'));
+  return card;
+}
+
+// Where each pocket sits on the layout, so a card can show the same grid the
+// bet was placed on.
+function rouletteNode(g) {
+  const card = el('div', `game-card roulette ${g.profit > 0 ? 'won' : ''}`.trim());
+
+  const head = el('div', 'game-head');
+  head.appendChild(el('span', 'game-title', 'Roulette'));
+  head.appendChild(el('span', 'game-stake', g.bet ? coins(g.bet) : 'for fun'));
+  head.appendChild(el('span', 'game-status', `${g.betLabel} · pays ${g.pays} to 1`));
+  card.appendChild(head);
+
+  const pocket = el('div', `pocket ${g.colour}`);
+  pocket.appendChild(el('span', 'pocket-number', String(g.number)));
+  pocket.appendChild(el('span', 'pocket-colour', g.colour));
+  const wheel = el('div', 'wheel');
+  wheel.appendChild(pocket);
+  card.appendChild(wheel);
+
+  const banner = el('div', `game-result ${g.profit > 0 ? 'win' : 'lose'}`);
+  banner.appendChild(el('strong', null, g.profit > 0
+    ? `+${g.profit.toLocaleString()} ${COIN}`
+    : `-${g.bet.toLocaleString()} ${COIN}`));
+  banner.appendChild(el('span', null, g.label));
+  card.appendChild(banner);
+
+  if (g.yourSeat) {
+    const actions = el('div', 'game-actions');
+    const again = el('button', 'btn small ghost', 'Spin again');
+    again.onclick = () => askRoulette(g.bet || 100);
+    actions.appendChild(again);
+    card.appendChild(actions);
+  }
+
+  card.appendChild(el('div', 'game-foot',
+    `${g.player ? g.player.username : 'someone'}'s spin`));
+  return card;
+}
+
 function statLine(label, value) {
   const row = el('div', 'stat');
   row.appendChild(el('span', 'stat-label', label));
@@ -876,17 +1116,21 @@ function infoCardNode(g) {
   const card = el('div', 'game-card info');
   const head = el('div', 'game-head');
   const titles = {
-    claim: 'Daily claim', balance: 'Wallet',
+    claim: 'Daily claim', balance: 'Wallet', work: 'Shift finished',
     bank: 'Sana Coin bank', leaderboard: 'Leaderboard',
+    purchase: 'Sana Coin shop', reset: 'Economy reset',
   };
-  head.appendChild(el('span', 'game-title', titles[g.kind] || 'Gamesman'));
+  head.appendChild(el('span', 'game-title', titles[g.kind] || 'Frontman'));
   card.appendChild(head);
 
-  if (g.kind === 'claim' || g.kind === 'balance') {
+  if (g.kind === 'purchase') return purchaseCard(card, g);
+  if (g.kind === 'reset') return resetCard(card, g);
+
+  if (g.kind === 'claim' || g.kind === 'balance' || g.kind === 'work') {
     const top = el('div', 'wallet-top');
     if (g.player) top.appendChild(avatar({ ...g.player, online: undefined }, 'lg'));
     const meta = el('div');
-    meta.appendChild(el('strong', null, g.player ? g.player.username : 'You'));
+    meta.appendChild(nameNode(g.player, 'wallet-name'));
     meta.appendChild(el('div', 'muted', `${g.stats.rank} · ${coins(g.coins)}`));
     top.appendChild(meta);
     card.appendChild(top);
@@ -896,6 +1140,22 @@ function infoCardNode(g) {
       b.appendChild(el('strong', null, `+${g.claimed.toLocaleString()} ${COIN}`));
       b.appendChild(el('span', null, 'Daily claim collected. Come back tomorrow.'));
       card.appendChild(b);
+    }
+
+    if (g.kind === 'work') {
+      const b = el('div', `game-result ${g.ok ? 'win' : 'lose'}`);
+      b.appendChild(el('strong', null, g.ok
+        ? `+${g.earned.toLocaleString()} ${COIN}`
+        : 'No pay this shift'));
+      b.appendChild(el('span', null, `You ${g.shift}.`));
+      card.appendChild(b);
+      if (g.raised) {
+        const rise = el('div', 'game-result win');
+        rise.appendChild(el('strong', null, '↑ Pay rise'));
+        rise.appendChild(el('span', null,
+          `Five more hours on the clock. You're on ${coins(g.workPay)} a shift now.`));
+        card.appendChild(rise);
+      }
     }
 
     const grid = el('div', 'stat-grid');
@@ -913,6 +1173,10 @@ function infoCardNode(g) {
         ? 'Daily claim is ready — use /claim'
         : `Next claim in ${formatWait(g.claimIn)}`));
     }
+    if (g.kind === 'work') {
+      card.appendChild(el('div', 'game-foot',
+        `Back on the clock in ${formatWait(g.workIn)}.`));
+    }
     return card;
   }
 
@@ -929,7 +1193,7 @@ function infoCardNode(g) {
     row.appendChild(pos);
     row.appendChild(avatar({ ...r, online: undefined }));
     const who = el('div', 'rank-who');
-    who.appendChild(el('strong', null, r.username));
+    who.appendChild(nameNode(r, 'rank-name'));
     who.appendChild(el('small', null, g.kind === 'bank'
       ? r.rank
       : `${r.rank} · ${r.wins}W / ${r.losses}L · best streak ${r.bestStreak}`));
@@ -952,6 +1216,7 @@ function gameNode(m) {
   if (g.mode === 'info') return infoCardNode(g);
   if (g.mode === 'poker') return pokerNode(g);
   if (g.mode === 'slots') return slotsNode(g);
+  if (g.mode === 'roulette') return rouletteNode(g);
 
   const card = el('div', `game-card ${g.status}`.trim());
 
@@ -1003,9 +1268,12 @@ function gameNode(m) {
     actions.appendChild(join);
   }
   if (g.yourTurn) {
-    ['hit', 'stand'].forEach((action) => {
-      const b = el('button', `btn small ${action === 'hit' ? 'primary' : ''}`.trim(),
-        action === 'hit' ? 'Hit' : 'Stand');
+    const moves = [['hit', 'Hit'], ['stand', 'Stand']];
+    // Doubling and splitting each put a second stake up, so they say so.
+    if (g.canDouble) moves.push(['double', g.bet ? `Double (${coins(g.bet)})` : 'Double']);
+    if (g.canSplit) moves.push(['split', g.bet ? `Split (${coins(g.bet)})` : 'Split']);
+    moves.forEach(([action, label]) => {
+      const b = el('button', `btn small ${action === 'hit' ? 'primary' : ''}`.trim(), label);
       b.onclick = async () => {
         [...actions.querySelectorAll('button')].forEach((x) => { x.disabled = true; });
         try {
@@ -1033,6 +1301,70 @@ function gameNode(m) {
   foot.textContent = `${hostName}'s game`;
   card.appendChild(foot);
   return card;
+}
+
+// ------------------------------------------------------------------- polls
+
+function pollNode(m) {
+  const p = m.poll;
+  const card = el('div', `poll-card ${p.closed ? 'closed' : ''}`.trim());
+
+  const head = el('div', 'game-head');
+  head.appendChild(el('span', 'game-title', p.closed ? 'Poll · closed' : 'Poll'));
+  head.appendChild(el('span', 'game-status',
+    `${p.voters} ${p.voters === 1 ? 'vote' : 'votes'}`
+    + (p.multi ? ' · pick as many as you like' : '')));
+  card.appendChild(head);
+  card.appendChild(el('h4', 'poll-question', p.question));
+
+  // The leader is only meaningful once somebody has voted, and only when it
+  // isn't a tie — otherwise every option looks like it's winning.
+  const top = Math.max(...p.options.map((o) => o.votes));
+  const leaders = p.options.filter((o) => o.votes === top && top > 0);
+
+  p.options.forEach((o) => {
+    const row = el('button', `poll-option ${o.mine ? 'mine' : ''}`.trim());
+    if (leaders.length === 1 && leaders[0] === o) row.classList.add('leading');
+    row.disabled = p.closed;
+
+    const fill = el('span', 'poll-fill');
+    fill.style.width = `${o.share}%`;
+    row.appendChild(fill);
+
+    const label = el('span', 'poll-label');
+    label.appendChild(el('span', 'poll-tick', o.mine ? '✓' : ''));
+    label.appendChild(el('span', 'poll-text', o.label));
+    row.appendChild(label);
+
+    row.appendChild(el('span', 'poll-count', `${o.votes} · ${o.share}%`));
+    if (!p.closed) row.onclick = () => votePoll(p.id, o.index);
+    card.appendChild(row);
+  });
+
+  const foot = el('div', 'poll-foot');
+  foot.appendChild(el('span', 'muted',
+    p.closed ? 'Final result.'
+             : (p.multi ? 'Click again to take a vote back.'
+                        : 'One vote each — click again to take it back.')));
+  if (p.isAuthor && !p.closed) {
+    const close = el('button', 'linkbtn', 'Close poll');
+    close.onclick = () => confirmModal('Close this poll?',
+      'Nobody will be able to vote after this, and the result stays on show.',
+      'Close poll', async () => {
+        const data = await api('POST', `/api/polls/${p.id}/close`);
+        replaceMessage(data.message);
+      }, false);
+    foot.appendChild(close);
+  }
+  card.appendChild(foot);
+  return card;
+}
+
+async function votePoll(pollId, choice) {
+  try {
+    const data = await api('POST', `/api/polls/${pollId}/vote`, { choice });
+    replaceMessage(data.message);
+  } catch (err) { toast(err.message, 'error'); }
 }
 
 /** Swap one message in place and redraw, keeping the scroll position. */
@@ -1124,15 +1456,11 @@ function reactionBar(m) {
     pill.appendChild(el('span', 'pill-emoji', r.emoji));
     pill.appendChild(el('span', 'pill-count', String(r.count)));
     pill.onclick = () => react_(m.id, r.emoji);
-    pill.onmouseenter = async () => {
-      if (pill.dataset.loaded) return;
-      pill.dataset.loaded = '1';
-      try {
-        const data = await api('GET', `/api/messages/${m.id}/reactions`);
-        const names = data.reactors[r.emoji] || [];
-        pill.title = `${names.join(', ')} reacted with ${r.emoji}`;
-      } catch { /* tooltip is optional */ }
-    };
+    pill.onmouseenter = () => showReactors(pill, m.id, r.emoji);
+    pill.onmouseleave = hideReactors;
+    // Keyboard and touch reach it too: focus opens the same card.
+    pill.onfocus = () => showReactors(pill, m.id, r.emoji);
+    pill.onblur = hideReactors;
     bar.appendChild(pill);
   });
 
@@ -1141,6 +1469,74 @@ function reactionBar(m) {
   add.onclick = (e) => openEmojiPicker(e.currentTarget, (emoji) => react_(m.id, emoji));
   bar.appendChild(add);
   return bar;
+}
+
+// ---------------------------------------------------- who reacted with what
+
+let reactorCard = null;
+let reactorToken = 0;
+
+function hideReactors() {
+  reactorToken += 1;                    // any in-flight fetch is now stale
+  if (reactorCard) { reactorCard.remove(); reactorCard = null; }
+}
+
+/**
+ * Hover card listing everyone behind a reaction pill.
+ *
+ * Refetched on every hover rather than cached: people add and remove
+ * reactions while you are looking at the message, and a list that was right
+ * once is worse than no list at all.
+ */
+async function showReactors(anchor, messageId, emoji) {
+  hideReactors();
+  const mine = ++reactorToken;
+
+  const card = el('div', 'popover reactor-pop');
+  card.appendChild(el('div', 'pop-title', `Reacted with ${emoji}`));
+  card.appendChild(el('div', 'muted', 'Loading…'));
+  document.body.appendChild(card);
+  reactorCard = card;
+  placeReactors(card, anchor);
+
+  let people = [];
+  try {
+    const data = await api('GET', `/api/messages/${messageId}/reactions`);
+    people = data.reactors[emoji] || [];
+  } catch {
+    if (mine === reactorToken && reactorCard === card) {
+      card.replaceChildren(el('div', 'muted', 'Could not load that just now.'));
+    }
+    return;
+  }
+  // The pointer may have moved on, or moved to a different pill, while we
+  // were waiting: only the newest request may draw.
+  if (mine !== reactorToken || reactorCard !== card) return;
+
+  card.replaceChildren();
+  card.appendChild(el('div', 'pop-title', `${people.length} reacted with ${emoji}`));
+  const list = el('div', 'reactor-list');
+  people.slice(0, 12).forEach((u) => {
+    const row = el('div', 'reactor');
+    row.appendChild(avatar({ ...u, online: undefined }, 'xs'));
+    row.appendChild(el('span', null, u.username));
+    list.appendChild(row);
+  });
+  if (people.length > 12) {
+    list.appendChild(el('div', 'muted', `and ${people.length - 12} more`));
+  }
+  card.appendChild(list);
+  placeReactors(card, anchor);
+}
+
+function placeReactors(card, anchor) {
+  const box = anchor.getBoundingClientRect();
+  const rect = card.getBoundingClientRect();
+  card.style.left = `${Math.max(8,
+    Math.min(box.left, window.innerWidth - rect.width - 8))}px`;
+  // Above the pill by default; below it when there is no room up there.
+  const above = box.top - rect.height - 8;
+  card.style.top = `${above < 8 ? box.bottom + 8 : above}px`;
 }
 
 // A small curated set — enough to be useful without shipping an emoji library.
@@ -1716,6 +2112,7 @@ function playPing() {
 // ------------------------------------------------------------ slash commands
 
 const COIN = '💰';
+const STARTING_COINS = 2000;      // matches db.STARTING_COINS
 
 function coins(n) {
   return `${Number(n).toLocaleString()} ${COIN}`;
@@ -1725,10 +2122,10 @@ const COMMANDS = [
   {
     name: '/blackjack',
     args: 'cpu',
-    summary: 'Play a hand against the Gamesman',
+    summary: 'Play a hand against the Frontman',
     takesNumber: true,
     optionalNumber: true,
-    run: (bet) => askStake('Blackjack vs the Gamesman', bet, (n) => startGame('cpu', n)),
+    run: (bet) => askStake('Blackjack vs the Frontman', bet, (n) => startGame('cpu', n)),
   },
   {
     name: '/blackjack',
@@ -1761,6 +2158,33 @@ const COMMANDS = [
     takesNumber: true,
     optionalNumber: true,
     run: (bet) => askStake('Slot machine', bet, spinSlots, 10),
+  },
+  {
+    name: '/roulette',
+    args: '<bet>',
+    summary: 'Single-zero wheel — pick a colour, a number, anything',
+    takesNumber: true,
+    optionalNumber: true,
+    run: (bet) => askRoulette(bet),
+  },
+  {
+    name: '/poll',
+    args: '<question>',
+    summary: 'Ask everyone a question and count the votes',
+    takesText: true,
+    run: (question) => openPollBuilder(question),
+  },
+  {
+    name: '/shop',
+    args: '',
+    summary: 'Spend Sana Coin on something permanent',
+    run: () => openShop(),
+  },
+  {
+    name: '/work',
+    args: '',
+    summary: 'Do a shift for Sana Coin, once an hour',
+    run: () => doWork(),
   },
   {
     name: '/gif',
@@ -1801,6 +2225,13 @@ const COMMANDS = [
     ownerOnly: true,
     run: (n) => confirmPurge(n),
   },
+  {
+    name: '/reset',
+    args: '',
+    summary: 'Wipe balances and the leaderboard — server owner only',
+    ownerOnly: true,
+    run: () => confirmReset(),
+  },
 ];
 
 /** Owner-only commands are hidden from everyone else's command list. */
@@ -1837,6 +2268,299 @@ function confirmPurge(count) {
       await reloadChannelMessages();
       toast(`Deleted ${data.deleted} message${data.deleted === 1 ? '' : 's'}.`, 'ok');
     });
+}
+
+function confirmReset() {
+  const guild = state.guilds.find((g) => g.id === state.activeGuildId);
+  if (!guild || !guild.isOwner) {
+    toast('Only the owner of a server can reset it.', 'error');
+    return;
+  }
+  confirmModal(
+    `Reset ${guild.name}'s economy?`,
+    `Everyone in ${guild.name} goes back to ${coins(STARTING_COINS)}, and every win, `
+    + 'loss, streak and record is wiped. Sana Coin is one balance per account, '
+    + 'so this resets what they hold in your other servers too. Perks they '
+    + 'bought from the shop are kept. This cannot be undone.',
+    'Reset everything',
+    () => frontmanCard('reset'));
+}
+
+const ROULETTE_BETS = [
+  { kind: 'red', label: 'Red', pays: '1:1', swatch: 'red' },
+  { kind: 'black', label: 'Black', pays: '1:1', swatch: 'black' },
+  { kind: 'odd', label: 'Odd', pays: '1:1' },
+  { kind: 'even', label: 'Even', pays: '1:1' },
+  { kind: 'low', label: '1–18', pays: '1:1' },
+  { kind: 'high', label: '19–36', pays: '1:1' },
+  { kind: 'dozen1', label: '1st dozen', pays: '2:1' },
+  { kind: 'dozen2', label: '2nd dozen', pays: '2:1' },
+  { kind: 'dozen3', label: '3rd dozen', pays: '2:1' },
+  { kind: 'col1', label: '1st column', pays: '2:1' },
+  { kind: 'col2', label: '2nd column', pays: '2:1' },
+  { kind: 'col3', label: '3rd column', pays: '2:1' },
+];
+
+/** Pick what you're backing, then how much. */
+async function askRoulette(preset) {
+  if (!state.activeChannelId) {
+    toast('Open a channel first.', 'error');
+    return;
+  }
+  const wallet = await refreshWallet();
+  const have = wallet ? wallet.coins : 0;
+
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Roulette'));
+    box.appendChild(el('p', 'sub',
+      `Single zero, so the wheel has 37 pockets. You have ${coins(have)}.`));
+
+    let chosen = 'red';
+    let number = null;
+
+    const grid = el('div', 'roulette-bets');
+    const paint = () => {
+      [...grid.querySelectorAll('button')].forEach((b) =>
+        b.classList.toggle('on', b.dataset.kind === chosen));
+    };
+    ROULETTE_BETS.forEach((b) => {
+      const cell = el('button', `roulette-bet ${b.swatch || ''}`.trim());
+      cell.type = 'button';
+      cell.dataset.kind = b.kind;
+      cell.appendChild(el('span', 'rb-label', b.label));
+      cell.appendChild(el('span', 'rb-pays', b.pays));
+      cell.onclick = () => { chosen = b.kind; number = null; numField.value = ''; paint(); };
+      grid.appendChild(cell);
+    });
+    box.appendChild(grid);
+
+    const numLabel = el('label', 'field');
+    numLabel.appendChild(el('span', null, 'Or straight up on a number — pays 35:1'));
+    const numField = el('input');
+    numField.type = 'number';
+    numField.min = '0';
+    numField.max = '36';
+    numField.placeholder = '0 to 36';
+    numField.oninput = () => {
+      if (numField.value === '') { chosen = 'red'; number = null; }
+      else { chosen = 'number'; number = parseInt(numField.value, 10); }
+      paint();
+    };
+    numLabel.appendChild(numField);
+    box.appendChild(numLabel);
+    paint();
+
+    const form = el('form');
+    const stakeLabel = el('label', 'field');
+    stakeLabel.appendChild(el('span', null, 'Stake'));
+    const stake = el('input');
+    stake.type = 'number';
+    stake.min = '10';
+    stake.max = String(have);
+    stake.value = String(preset != null ? preset : Math.min(100, have));
+    stakeLabel.appendChild(stake);
+    stakeLabel.appendChild(el('small', null, 'Minimum 10 Sana Coin.'));
+    form.appendChild(stakeLabel);
+
+    const quick = el('div', 'stake-quick');
+    [100, 500, 1000, 5000].filter((n) => n <= have).forEach((n) => {
+      const b = el('button', 'btn small ghost', n.toLocaleString());
+      b.type = 'button';
+      b.onclick = () => { stake.value = String(n); };
+      quick.appendChild(b);
+    });
+    form.appendChild(quick);
+
+    const actions = el('div', 'modal-actions');
+    const cancel = el('button', 'btn ghost', 'Cancel');
+    cancel.type = 'button';
+    cancel.onclick = close;
+    const go = el('button', 'btn primary', 'Spin');
+    actions.append(cancel, go);
+    form.appendChild(actions);
+
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      const n = parseInt(stake.value, 10);
+      if (Number.isNaN(n) || n < 10) return toast('Minimum spin is 10 Sana Coin.', 'error');
+      if (n > have) return toast(`You only have ${coins(have)}.`, 'error');
+      if (chosen === 'number' && !(number >= 0 && number <= 36)) {
+        return toast('Pick a number from 0 to 36.', 'error');
+      }
+      close();
+      spinRoulette(chosen, n, number);
+    };
+    box.appendChild(form);
+  });
+}
+
+async function spinRoulette(kind, bet, number) {
+  try {
+    const data = await api('POST', `/api/channels/${state.activeChannelId}/roulette`,
+      { kind, bet, number });
+    if (data.wallet) state.wallet = data.wallet;
+    pushMessage(data.message);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+const doWork = () => frontmanCard('work');
+
+// ------------------------------------------------------------------- shop
+
+async function openShop() {
+  let data;
+  try { data = await api('GET', '/api/shop'); }
+  catch (err) { return toast(err.message, 'error'); }
+
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Sana Coin shop'));
+    const sub = el('p', 'sub', `Everything here is permanent. You have ${coins(data.coins)}.`);
+    box.appendChild(sub);
+
+    const list = el('div', 'shop-list');
+    data.items.forEach((item) => {
+      const row = el('div', `shop-item ${item.owned ? 'owned' : ''}`.trim());
+      row.appendChild(el('div', 'shop-icon', item.icon));
+
+      const text = el('div', 'shop-text');
+      text.appendChild(el('strong', null, item.name));
+      text.appendChild(el('div', 'muted', item.summary));
+      text.appendChild(el('small', 'shop-detail', item.detail));
+      row.appendChild(text);
+
+      const buy = el('button', `btn small ${item.owned ? 'ghost' : 'primary'}`,
+        item.owned ? 'Owned' : coins(item.price));
+      buy.disabled = item.owned || data.coins < item.price;
+      if (!item.owned && data.coins < item.price) {
+        buy.title = `${(item.price - data.coins).toLocaleString()} short`;
+      }
+      buy.onclick = () => {
+        close();
+        confirmBuy(item);
+      };
+      row.appendChild(buy);
+      list.appendChild(row);
+    });
+    box.appendChild(list);
+  });
+}
+
+function confirmBuy(item) {
+  confirmModal(
+    `Buy the ${item.name.toLowerCase()}?`,
+    `${item.summary} ${item.detail} It costs ${coins(item.price)}, and there `
+    + 'are no refunds.',
+    `Pay ${coins(item.price)}`,
+    async () => {
+      const data = await api('POST', '/api/shop/buy',
+        { item: item.id, channelId: state.activeChannelId || undefined });
+      if (data.wallet) state.wallet = data.wallet;
+      if (data.message) pushMessage(data.message);
+      // Perks change how names and channel lists are drawn everywhere.
+      await refreshMe();
+      await refreshAll();
+      if (state.activeChannelId) renderMessages();
+      toast(`${item.name} unlocked.`, 'ok');
+    }, false);
+}
+
+async function refreshMe() {
+  try {
+    const data = await api('GET', '/api/me');
+    if (data.user) state.me = data.user;
+  } catch { /* the next poll will catch up */ }
+}
+
+// ------------------------------------------------------------------- polls
+
+function openPollBuilder(question) {
+  if (!state.activeChannelId) {
+    toast('Open a channel first.', 'error');
+    return;
+  }
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Create a poll'));
+    box.appendChild(el('p', 'sub',
+      'Two options at least, six at most. Everyone in the channel can vote.'));
+
+    const form = el('form');
+    const qLabel = el('label', 'field');
+    qLabel.appendChild(el('span', null, 'Question'));
+    const qField = el('input');
+    qField.maxLength = 200;
+    qField.required = true;
+    qField.placeholder = 'Where are we ordering from?';
+    qField.value = question || '';
+    qLabel.appendChild(qField);
+    form.appendChild(qLabel);
+
+    const options = el('div', 'poll-fields');
+    form.appendChild(options);
+
+    const addOption = (value = '') => {
+      if (options.children.length >= 6) return;
+      const wrap = el('div', 'poll-field');
+      const field = el('input');
+      field.maxLength = 80;
+      field.placeholder = `Option ${options.children.length + 1}`;
+      field.value = value;
+      wrap.appendChild(field);
+      const drop = el('button', 'icon-btn', '×');
+      drop.type = 'button';
+      drop.title = 'Remove';
+      drop.onclick = () => {
+        if (options.children.length <= 2) return;
+        wrap.remove();
+        more.disabled = false;
+      };
+      wrap.appendChild(drop);
+      options.appendChild(wrap);
+    };
+    addOption();
+    addOption();
+
+    const more = el('button', 'btn small ghost', 'Add another option');
+    more.type = 'button';
+    more.onclick = () => {
+      addOption();
+      more.disabled = options.children.length >= 6;
+    };
+    form.appendChild(more);
+
+    const multiLabel = el('label', 'field toggle-field');
+    const multi = el('input');
+    multi.type = 'checkbox';
+    multiLabel.appendChild(multi);
+    const multiText = el('div');
+    multiText.appendChild(el('strong', null, 'Allow more than one answer'));
+    multiText.appendChild(el('small', null,
+      'Off, everyone gets one vote and changing it moves the old one.'));
+    multiLabel.appendChild(multiText);
+    form.appendChild(multiLabel);
+
+    const actions = el('div', 'modal-actions');
+    const cancel = el('button', 'btn ghost', 'Cancel');
+    cancel.type = 'button';
+    cancel.onclick = close;
+    const go = el('button', 'btn primary', 'Post poll');
+    actions.append(cancel, go);
+    form.appendChild(actions);
+
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const labels = [...options.querySelectorAll('input')]
+        .map((i) => i.value.trim()).filter(Boolean);
+      if (labels.length < 2) return toast('A poll needs at least two options.', 'error');
+      go.disabled = true;
+      try {
+        const data = await api('POST', `/api/channels/${state.activeChannelId}/polls`,
+          { question: qField.value.trim(), options: labels, multi: multi.checked });
+        pushMessage(data.message);
+        close();
+      } catch (err) { toast(err.message, 'error'); go.disabled = false; }
+    };
+    box.appendChild(form);
+  });
 }
 
 async function refreshWallet() {
@@ -2079,24 +2803,24 @@ async function spinSlots(bet) {
   } catch (err) { toast(err.message, 'error'); }
 }
 
-/** The Gamesman answers these in-channel rather than in a local dialog. */
-async function gamesmanCard(kind) {
+/** The Frontman answers these in-channel rather than in a local dialog. */
+async function frontmanCard(kind) {
   if (!state.activeChannelId) {
     toast('Open a channel first.', 'error');
     return;
   }
   try {
-    const data = await api('POST', `/api/channels/${state.activeChannelId}/gamesman`,
+    const data = await api('POST', `/api/channels/${state.activeChannelId}/frontman`,
       { kind });
     if (data.wallet) state.wallet = data.wallet;
     pushMessage(data.message);
   } catch (err) { toast(err.message, 'error'); }
 }
 
-const claimDaily = () => gamesmanCard('claim');
-const showWallet = () => gamesmanCard('balance');
-const showBank = () => gamesmanCard('bank');
-const showLeaderboard = () => gamesmanCard('leaderboard');
+const claimDaily = () => frontmanCard('claim');
+const showWallet = () => frontmanCard('balance');
+const showBank = () => frontmanCard('bank');
+const showLeaderboard = () => frontmanCard('leaderboard');
 
 function formatWait(seconds) {
   const h = Math.floor(seconds / 3600);
@@ -2442,8 +3166,12 @@ async function startPoll() {
         const known = new Set(state.messages.map((m) => m.id));
         const fresh = data.messages.filter((m) => !known.has(m.id));
         if (fresh.length) {
-          // Chime once per batch, not once per message.
-          if (fresh.some((m) => m.mentionsMe && m.author.id !== state.me.id)) playPing();
+          // Chime once per batch, not once per message — and not at all from
+          // a channel that has been muted.
+          if (!activeChannelMuted()
+              && fresh.some((m) => m.mentionsMe && m.author.id !== state.me.id)) {
+            playPing();
+          }
           state.messages.push(...fresh);
           renderMessages();
           if (state.atBottom) scrollToBottom();
@@ -2516,12 +3244,19 @@ async function stillSignedIn() {
 
 // ------------------------------------------------------------------ data
 
-/** Unread pings across every server channel and DM. */
+/** Unread pings across every unmuted server channel, and every DM. */
 function totalMentions() {
   const inGuilds = state.guilds.reduce(
-    (n, g) => n + g.channels.reduce((c, ch) => c + (ch.mentions || 0), 0), 0);
+    (n, g) => n + g.channels.reduce(
+      (c, ch) => c + (ch.muted ? 0 : (ch.mentions || 0)), 0), 0);
   const inDms = state.dms.reduce((n, d) => n + (d.mentions || 0), 0);
   return inGuilds + inDms;
+}
+
+/** Is the channel currently on screen muted? */
+function activeChannelMuted() {
+  return state.guilds.some((g) => g.channels.some(
+    (c) => c.id === state.activeChannelId && c.muted));
 }
 
 async function refreshSidebarData() {
@@ -3135,12 +3870,12 @@ async function copyText(text) {
 function showBotPanel() {
   openModal((box, close) => {
     const head = el('div', 'profile-head');
-    const icon = el('div', 'avatar xl', 'G');
-    icon.style.background = '#3ba55d';
-    head.appendChild(icon);
+    // Pull the real member-list entry so the mask shows, rather than an initial.
+    const bot = state.members.find((m) => m.isBot);
+    head.appendChild(avatar(bot || { username: 'Frontman', color: '#1f2126' }, 'xl'));
     const meta = el('div');
-    meta.appendChild(el('h2', null, 'Gamesman'));
-    meta.appendChild(el('p', 'muted', 'Deals blackjack in every server.'));
+    meta.appendChild(el('h2', null, 'Frontman'));
+    meta.appendChild(el('p', 'muted', "Runs the games in every server."));
     head.appendChild(meta);
     box.appendChild(head);
 
