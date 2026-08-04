@@ -2,6 +2,7 @@
 
     python3 tests/test_rules.py
 """
+import datetime
 import os
 import sys
 import time
@@ -64,10 +65,16 @@ check("the shop sells the ticket at the same price",
       db.SHOP_BY_ID["lottery"]["price"] == db.LOTTERY_PRICE)
 
 draw = db.next_draw_at()
-check("the draw lands on the hour",
-      time.localtime(draw).tm_hour == db.DRAW_HOUR
-      and time.localtime(draw).tm_min == 0,
-      time.strftime("%H:%M", time.localtime(draw)))
+there = datetime.datetime.fromtimestamp(draw, db.DRAW_ZONE)
+check("the draw lands on the hour in Australian eastern time",
+      there.hour == db.DRAW_HOUR and there.minute == 0,
+      f"{there:%H:%M %Z}")
+check("the zone is the eastern one, not the server's",
+      str(db.DRAW_ZONE) in ("Australia/Sydney", "AEST"), str(db.DRAW_ZONE))
+check("that zone really is UTC+10 or +11",
+      there.utcoffset() in (datetime.timedelta(hours=10),
+                            datetime.timedelta(hours=11)),
+      there.utcoffset())
 check("the next draw is in the future", draw > time.time())
 check("the next draw is within a day", draw - time.time() <= 86400 + 3600)
 check("a ticket bought after the draw goes into the next one",

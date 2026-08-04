@@ -3876,9 +3876,8 @@ def main():
             print("  Restart without --host 127.0.0.1 to let people in.")
     print()
     report_storage(existed)
-    draw_at = db.next_draw_at()
-    print(f"  Lottery draw:      {time.strftime('%H:%M', time.localtime(draw_at))}"
-          f" daily (next in {wait_text(db.next_draw_in())})")
+    print(f"  Lottery draw:      {db.draw_clock()} daily"
+          f" (next in {wait_text(db.next_draw_in())})")
     print(flush=True)
 
     # Daemon, so Ctrl-C doesn't have to wait for it to come round again.

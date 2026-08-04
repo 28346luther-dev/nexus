@@ -1,11 +1,13 @@
 """SQLite storage layer. Stdlib only."""
 
+import datetime
 import os
 import re
 import secrets
 import sqlite3
 import hashlib
 import time
+import zoneinfo
 
 # NEXUS_DB lets you point a second instance at a throwaway database, so tests
 # never touch real accounts and messages.
@@ -441,22 +443,48 @@ LOTTERY_PRICE = 500
 LOTTERY_ODDS = 300              # one in this many tickets wins
 LOTTERY_PRIZE = 100_000
 
-# The draw runs at this hour, in the server's own time zone. Railway runs in
-# UTC, so set NEXUS_DRAW_HOUR if six o'clock there isn't six o'clock for you.
+# Six o'clock in Australian eastern time, not wherever the server happens to
+# be — Railway runs in UTC, and the draw should land at the same time on the
+# players' clocks whichever machine it runs on.
 DRAW_HOUR = max(0, min(23, int(os.environ.get("NEXUS_DRAW_HOUR", "18"))))
+DRAW_TZ_NAME = os.environ.get("NEXUS_DRAW_TZ") or "Australia/Sydney"
+
+
+def _draw_zone():
+    """The zone the draw hour is read in.
+
+    Australia/Sydney rather than a fixed +10 so the draw stays at six on the
+    wall clock through daylight saving instead of drifting to five. Container
+    images sometimes ship without the tz database; a fixed AEST offset is the
+    fallback, which is exactly right for Brisbane and an hour out for Sydney
+    over summer.
+    """
+    try:
+        return zoneinfo.ZoneInfo(DRAW_TZ_NAME)
+    except Exception:
+        return datetime.timezone(datetime.timedelta(hours=10), "AEST")
+
+
+DRAW_ZONE = _draw_zone()
 
 
 def next_draw_at(ts=None):
     """When the next draw happens: the next DRAW_HOUR at or after `ts`."""
     ts = int(ts if ts is not None else now())
-    lt = time.localtime(ts)
-    at = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
-                          DRAW_HOUR, 0, 0, 0, 0, -1)))
-    if at <= ts:
-        # mktime normalises a day past the end of the month for us.
-        at = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1,
-                              DRAW_HOUR, 0, 0, 0, 0, -1)))
-    return at
+    here = datetime.datetime.fromtimestamp(ts, DRAW_ZONE)
+    at = here.replace(hour=DRAW_HOUR, minute=0, second=0, microsecond=0)
+    if at.timestamp() <= ts:
+        # Adding a day is 24 real hours, which lands an hour off across a
+        # daylight-saving change — so the wall clock is pinned again after.
+        at = (at + datetime.timedelta(days=1)).replace(
+            hour=DRAW_HOUR, minute=0, second=0, microsecond=0)
+    return int(at.timestamp())
+
+
+def draw_clock(ts=None):
+    """The draw time as the players read it, for the banner."""
+    at = datetime.datetime.fromtimestamp(next_draw_at(ts), DRAW_ZONE)
+    return f"{at:%H:%M} {at:%Z}"
 
 
 def next_draw_in(ts=None):

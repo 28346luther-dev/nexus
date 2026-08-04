@@ -131,7 +131,8 @@ platform's health check at it.
 | `NEXUS_DB`      | `./data.db`          | Database location. Point at your volume in prod.  |
 | `NEXUS_UPLOADS` | next to `NEXUS_DB`   | Where uploaded images are written.                |
 | `GIPHY_API_KEY` | unset                | Enables `/gif`. Without it the picker says so.    |
-| `NEXUS_DRAW_HOUR` | `18`               | Hour of the daily lottery draw, server local time.|
+| `NEXUS_DRAW_HOUR` | `18`               | Hour of the daily lottery draw.                   |
+| `NEXUS_DRAW_TZ` | `Australia/Sydney`   | Zone that hour is read in, whatever the host uses.|
 
 ### Turning on GIFs
 
@@ -298,11 +299,15 @@ one-in-three-hundred chances, not one better one. The draw runs **once a day at
 six**, and the Frontman posts the result to every server's `#general` with an
 `@everyone` — winners are named by tag, so they get a ping of their own too.
 
+Six o'clock means **6pm Australian eastern time** — the players' clock, not the
+server's. Railway runs in UTC, so the draw lands at 08:00 UTC over winter and
+07:00 UTC once daylight saving starts; either way it is six in Sydney. Change
+it with `NEXUS_DRAW_HOUR` and `NEXUS_DRAW_TZ` (any IANA zone name).
+
 The draw is a background thread rather than a lazy check, so it happens at six
 whether or not anyone is looking. If the server is down at six, the draw runs
 on the next boot — late, but never skipped, and never twice: the first writer
-of the draw row owns it. Six o'clock means the **server's** local time, which
-on Railway is UTC; set `NEXUS_DRAW_HOUR` to move it.
+of the draw row owns it.
 
 **GIFs** — the **GIF** button in the message bar, or `/gif <search>`, opens a
 Giphy picker. Tap ★ on any GIF to keep it,
