@@ -74,8 +74,8 @@ DB_PATH = sys.argv[2] if len(sys.argv) > 2 else "/tmp/nexus_test.db"
 # ==================================================================== work
 s, r = owner.call("POST", "/api/wallet/work")
 check("a shift is worked", s == 200, r)
-check("a good shift pays 2,000, a bad one pays nothing",
-      r["earned"] == (2000 if r["ok"] else 0), r)
+check("a good shift pays 500, a bad one pays nothing",
+      r["earned"] == (500 if r["ok"] else 0), r)
 check("the shift comes with a story", bool(r["shift"]), r)
 check("the hour goes on the clock either way", r["workShifts"] == 1, r)
 check("four shifts to the first rise", r["shiftsToRaise"] == 4, r)
@@ -160,7 +160,7 @@ s, r = member.call("POST", "/api/shop/buy", {"item": "goldpass"})
 check("the gold pass can be bought", s == 200, r)
 check("the gold pass doubles the daily claim",
       r["wallet"]["dailyAmount"] == 10_000, r["wallet"])
-check("the gold pass doubles the shift", r["wallet"]["workPay"] == 4000, r["wallet"])
+check("the gold pass doubles the shift", r["wallet"]["workPay"] == 1000, r["wallet"])
 
 # =================================================================== mutes
 chans = channels_of(member, gid)

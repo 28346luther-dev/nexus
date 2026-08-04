@@ -306,7 +306,7 @@ CLAIM_INTERVAL = 60 * 60 * 24
 # The shift. Frequent enough that someone who busts out is never stuck waiting
 # a day to play, and unreliable enough that it isn't a substitute for playing:
 # one shift in five goes wrong and pays nothing.
-WORK_PAY = 2000
+WORK_PAY = 500
 WORK_INTERVAL = 60 * 60
 WORK_INTERVAL_VAULT = 60 * 30     # halved by the Sana Vault perk
 WORK_SUCCESS = 0.8

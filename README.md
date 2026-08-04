@@ -221,15 +221,16 @@ so they can't simply be bought.
 
 ### Working for it
 
-`/work` is an hour's shift for **2,000 Sana Coin** — four times out of five.
-The fifth is a bad day: you reversed the drinks trolley over the boss's cat, or
-let a man in a false moustache walk out with the chip tray, and you go home
-unpaid. The hour still counts.
+`/work` is an hour's shift for **500 Sana Coin** — four times out of five. The
+fifth is a bad day: you reversed the drinks trolley over the boss's cat, or let
+a man in a false moustache walk out with the chip tray, and you go home unpaid.
+The hour still counts.
 
 Every **five hours on the clock** earns a **20% rise**, compounding, until the
-pay packet tops out at **10,000** a shift — about 45 hours of work. The Gold
-Pass doubles whatever you're on, cap included, and the Sana Vault halves the
-wait between shifts.
+pay packet tops out at **10,000** a shift — 85 hours of work, so top rate is
+something you get to rather than something you turn up to. The Gold Pass
+doubles whatever you're on, cap included, and the Sana Vault halves the wait
+between shifts.
 
 **Card secrecy.** In 1v1 blackjack you see only your own cards until the hand
 settles, and spectators see neither — showing both would let whoever acts

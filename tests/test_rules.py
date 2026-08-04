@@ -25,19 +25,19 @@ def check(name, cond, detail=""):
 
 
 # ------------------------------------------------------------------- wages
-check("a new starter is on 2,000", db.work_rate(0) == 2000, db.work_rate(0))
-check("no rise before five hours", db.work_rate(4) == 2000, db.work_rate(4))
-check("five hours earns 20%", db.work_rate(5) == 2400, db.work_rate(5))
-check("rises compound", db.work_rate(10) == 2880, db.work_rate(10))
-check("and keep compounding", db.work_rate(15) == 3456, db.work_rate(15))
-check("the pay tops out at 10,000", db.work_rate(45) == 10_000, db.work_rate(45))
+check("a new starter is on 500", db.work_rate(0) == 500, db.work_rate(0))
+check("no rise before five hours", db.work_rate(4) == 500, db.work_rate(4))
+check("five hours earns 20%", db.work_rate(5) == 600, db.work_rate(5))
+check("rises compound", db.work_rate(10) == 720, db.work_rate(10))
+check("and keep compounding", db.work_rate(15) == 864, db.work_rate(15))
+check("the pay tops out at 10,000", db.work_rate(85) == 10_000, db.work_rate(85))
 check("and stays there", db.work_rate(500) == 10_000, db.work_rate(500))
 check("pay never goes backwards",
       all(db.work_rate(n) <= db.work_rate(n + 1) for n in range(0, 200)))
 check("the countdown to a rise runs 5 to 1",
       [db.shifts_to_raise(n) for n in range(5)] == [5, 4, 3, 2, 1],
       [db.shifts_to_raise(n) for n in range(5)])
-check("no countdown once the pay has topped out", db.shifts_to_raise(45) == 0)
+check("no countdown once the pay has topped out", db.shifts_to_raise(85) == 0)
 check("the gold pass doubles the rate",
       db.work_pay({"goldpass"}, 10) == db.work_rate(10) * 2)
 check("the vault halves the wait",
