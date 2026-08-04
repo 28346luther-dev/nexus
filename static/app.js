@@ -119,7 +119,27 @@ function avatar(user, size = '') {
   }
   if (user.online !== undefined) node.dataset.status = user.online ? 'online' : 'offline';
   if (hasPerk(user, 'ring')) node.classList.add('ringed');
+  // Decorations sit on top of the avatar. Skipped at xs, where a hat on a
+  // 16px circle is a smudge rather than a joke.
+  if (user.decoration === 'fedora' && size !== 'xs') node.appendChild(fedoraNode());
   return node;
+}
+
+/** The fedora, drawn rather than uploaded so it stays sharp at every size. */
+function fedoraNode() {
+  const hat = document.createElement('div');
+  hat.className = 'decoration fedora';
+  hat.title = 'Fedora';
+  hat.innerHTML = `
+    <svg viewBox="0 0 100 52" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <ellipse cx="50" cy="40" rx="47" ry="9" fill="#1b1c20"/>
+      <ellipse cx="50" cy="38" rx="47" ry="9" fill="#31333b"/>
+      <path d="M30 39 C29 20 33 8 50 8 C67 8 71 20 70 39 Z" fill="#3c3f49"/>
+      <path d="M50 8 C40 8 35 14 33 22 C38 16 44 14 50 14 Z" fill="#4a4e5a"/>
+      <path d="M29 30 H71 V38 H29 Z" fill="#c8a24a"/>
+      <path d="M29 30 H71 V33 H29 Z" fill="#dcb75f"/>
+    </svg>`;
+  return hat;
 }
 
 function hasPerk(user, id) {
@@ -810,6 +830,16 @@ function seatRow(seat, label, isTurn) {
   return wrap;
 }
 
+/** "Balance: 12,340" — what the viewer is holding, live, beside the stake. */
+function balanceChip(g) {
+  const chip = el('span', 'game-balance');
+  chip.appendChild(el('span', 'gb-label', 'Balance:'));
+  chip.appendChild(el('span', 'gb-value', Number(g.balance || 0).toLocaleString()));
+  chip.appendChild(el('span', null, COIN));
+  chip.title = 'What you are holding right now';
+  return chip;
+}
+
 const SPLIT_OUTCOME = { host: 'won', opp: 'lost', push: 'push' };
 
 function splitHandNode(h, index) {
@@ -840,7 +870,8 @@ function slotsNode(g) {
   const card = el('div', `game-card slots ${g.profit > 0 ? 'won' : ''}`.trim());
   const head = el('div', 'game-head');
   head.appendChild(el('span', 'game-title', 'Slot machine'));
-  head.appendChild(el('span', 'game-status', g.bet ? coins(g.bet) : 'for fun'));
+  head.appendChild(el('span', 'game-stake', g.bet ? coins(g.bet) : 'for fun'));
+  head.appendChild(balanceChip(g));
   card.appendChild(head);
 
   const reels = el('div', 'reels');
@@ -883,6 +914,7 @@ function pokerNode(g) {
   const head = el('div', 'game-head');
   head.appendChild(el('span', 'game-title', "Poker · Hold'em"));
   if (g.ante) head.appendChild(el('span', 'game-stake', coins(g.ante)));
+  head.appendChild(balanceChip(g));
   const status = `${STAGE_LABEL[g.stage]} · pot ${g.pot.toLocaleString()} ${COIN}`;
   head.appendChild(el('span', 'game-status',
     g.toMatch ? `${status} · ${g.toMatch.toLocaleString()} to match` : status));
@@ -1075,6 +1107,7 @@ function rouletteNode(g) {
   const head = el('div', 'game-head');
   head.appendChild(el('span', 'game-title', 'Roulette'));
   head.appendChild(el('span', 'game-stake', g.bet ? coins(g.bet) : 'for fun'));
+  head.appendChild(balanceChip(g));
   head.appendChild(el('span', 'game-status', `${g.betLabel} · pays ${g.pays} to 1`));
   card.appendChild(head);
 
@@ -1228,6 +1261,7 @@ function gameNode(m) {
     stake.title = g.mode === 'pvp' ? `Pot: ${coins(g.bet * 2)}` : 'Your stake';
     head.appendChild(stake);
   }
+  head.appendChild(balanceChip(g));
   const status = el('span', 'game-status');
   if (g.status === 'waiting') status.textContent = 'Waiting for an opponent';
   else if (g.status === 'finished') status.textContent = 'Finished';
@@ -2414,8 +2448,8 @@ async function openShop() {
 
   openModal((box, close) => {
     box.appendChild(el('h2', null, 'Sana Coin shop'));
-    const sub = el('p', 'sub', `Everything here is permanent. You have ${coins(data.coins)}.`);
-    box.appendChild(sub);
+    box.appendChild(el('p', 'sub',
+      `The perks are permanent; the ticket is a gamble. You have ${coins(data.coins)}.`));
 
     const list = el('div', 'shop-list');
     data.items.forEach((item) => {
@@ -2425,7 +2459,13 @@ async function openShop() {
       const text = el('div', 'shop-text');
       text.appendChild(el('strong', null, item.name));
       text.appendChild(el('div', 'muted', item.summary));
-      text.appendChild(el('small', 'shop-detail', item.detail));
+      text.appendChild(el('small', 'shop-detail', item.repeatable
+        ? `${item.detail} Next draw in ${formatWait(data.drawIn)}.`
+        : item.detail));
+      if (item.held) {
+        text.appendChild(el('small', 'shop-held',
+          `You hold ${item.held} ticket${item.held === 1 ? '' : 's'} for it.`));
+      }
       row.appendChild(text);
 
       const buy = el('button', `btn small ${item.owned ? 'ghost' : 'primary'}`,
@@ -2434,15 +2474,29 @@ async function openShop() {
       if (!item.owned && data.coins < item.price) {
         buy.title = `${(item.price - data.coins).toLocaleString()} short`;
       }
-      buy.onclick = () => {
-        close();
-        confirmBuy(item);
-      };
+      // Tickets are bought over and over, so the shop stays open and refreshes
+      // in place; a perk is a one-off, and gets a confirmation.
+      buy.onclick = item.repeatable
+        ? () => buyTicket(item, close)
+        : () => { close(); confirmBuy(item); };
       row.appendChild(buy);
       list.appendChild(row);
     });
     box.appendChild(list);
   });
+}
+
+async function buyTicket(item, close) {
+  try {
+    const data = await api('POST', '/api/shop/buy',
+      { item: item.id, channelId: state.activeChannelId || undefined });
+    if (data.wallet) state.wallet = data.wallet;
+    if (data.message) pushMessage(data.message);
+    const held = data.wallet && data.wallet.lottery ? data.wallet.lottery.tickets : 1;
+    toast(`Ticket bought — you hold ${held} for the next draw.`, 'ok');
+    close();
+    openShop();                       // reopen with the new count and balance
+  } catch (err) { toast(err.message, 'error'); }
 }
 
 function confirmBuy(item) {
@@ -3266,10 +3320,24 @@ async function refreshSidebarData() {
     api('GET', '/api/friends'),
     api('GET', '/api/wallet').catch(() => null),
   ]);
-  if (wallet) state.wallet = wallet;
+  if (wallet) {
+    state.wallet = wallet;
+    announceLottery(wallet.lotteryResults);
+  }
   state.guilds = guilds.guilds;
   state.dms = dms.dms;
   state.friends = friends;
+}
+
+/** Your own half of the draw. The server hands each result over once. */
+function announceLottery(result) {
+  if (!result || !result.tickets) return;
+  if (result.won) {
+    toast(`🎟 Your lottery ticket came up — ${coins(result.won)}!`, 'ok');
+    return;
+  }
+  const n = result.tickets;
+  toast(`🎟 No luck in the draw — ${n} ticket${n === 1 ? '' : 's'} went down.`);
 }
 
 async function refreshAll() {
@@ -4120,6 +4188,37 @@ $('#me-settings').onclick = () => {
       'Chimes for @mentions and @everyone, in any channel.'));
     soundLabel.appendChild(soundText);
     form.appendChild(soundLabel);
+
+    // Only shown to people who bought one — there is nothing to toggle
+    // otherwise, and an empty switch just raises questions.
+    if (hasPerk(state.me, 'fedora')) {
+      const hatLabel = el('label', 'field toggle-field');
+      const hatBox = el('input');
+      hatBox.type = 'checkbox';
+      hatBox.checked = state.me.decoration === 'fedora';
+      hatBox.onchange = async () => {
+        try {
+          const data = await api('PATCH', '/api/me',
+            { decoration: hatBox.checked ? 'fedora' : '' });
+          state.me = data.user;
+          refreshPic();
+          renderMe();
+          renderMessages();
+          renderMembers();
+        } catch (err) {
+          toast(err.message, 'error');
+          hatBox.checked = !hatBox.checked;
+        }
+      };
+      hatLabel.appendChild(hatBox);
+      const hatText = el('div');
+      hatText.appendChild(el('strong', null, 'Wear the fedora 🎩'));
+      hatText.appendChild(el('small', null,
+        'Sits on your avatar wherever it appears. Take it off and back on as '
+        + 'often as you like — it stays yours.'));
+      hatLabel.appendChild(hatText);
+      form.appendChild(hatLabel);
+    }
 
     const colorLabel = el('label', 'field');
     colorLabel.appendChild(el('span', null, 'Avatar colour'));

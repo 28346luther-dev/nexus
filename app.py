@@ -18,6 +18,7 @@ import select
 import socket
 import ssl
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.error
@@ -352,10 +353,13 @@ def serialize_messages(conn, rows, user_id):
             g["id"]: g
             for g in conn.execute(f"SELECT * FROM games WHERE id IN ({gmarks})", game_ids)
         }
+        # Every card shows the viewer's balance, and it is the same number on
+        # all of them, so it is looked up once for the whole page.
+        purse = db.balance(conn, user_id)
         for m in out:
             g = games.get(m["gameId"])
             if g:
-                m["game"] = serialize_game(conn, g, user_id)
+                m["game"] = serialize_game(conn, g, user_id, purse)
 
     poll_ids = [m["pollId"] for m in out if m["pollId"]]
     if poll_ids:
@@ -421,6 +425,7 @@ def serialize_message(row):
             "color": row["color"],
             "avatarUrl": f"/uploads/{row['avatar']}" if row["avatar"] else None,
             "isBot": bool(row["is_bot"]),
+            "decoration": db.decoration_of(row),
             # Filled in by serialize_messages, which can batch the lookup.
             "perks": [],
         },
@@ -428,7 +433,8 @@ def serialize_message(row):
 
 
 MESSAGE_SELECT = """
-SELECT m.*, u.username, u.discriminator, u.color, u.avatar, u.is_bot
+SELECT m.*, u.username, u.discriminator, u.color, u.avatar, u.is_bot,
+       u.decoration
 FROM messages m JOIN users u ON u.id = m.author_id
 """
 
@@ -608,6 +614,7 @@ def me_payload(row, perks=()):
         "color": row["color"],
         "bio": row["bio"],
         "status": row["status"],
+        "decoration": db.decoration_of(row),
         "avatarUrl": db.avatar_url(row),
     }
 
@@ -631,6 +638,15 @@ def api_update_me(req):
         # One short line — anything longer would wreck the member list layout.
         fields.append("status = ?")
         values.append(" ".join(str(req.body["status"]).split())[:60])
+    if "decoration" in req.body:
+        # Taking the hat off is always allowed; putting one on means owning it.
+        wanted = str(req.body["decoration"] or "").lower()
+        if wanted and wanted not in db.perks_for(req.conn, req.user["id"]):
+            raise HttpError(403, "You don't own that.")
+        if wanted and not db.SHOP_BY_ID.get(wanted, {}).get("decoration"):
+            raise HttpError(400, "That isn't something you can wear.")
+        fields.append("decoration = ?")
+        values.append(wanted)
     if "color" in req.body:
         color = str(req.body["color"])
         if not re.match(r"^#[0-9a-fA-F]{6}$", color):
@@ -2098,6 +2114,13 @@ def wallet_payload(conn, user_id):
         "shiftsToRaise": db.shifts_to_raise(row["work_shifts"]),
         "workOdds": db.WORK_SUCCESS,
         "perks": sorted(perks),
+        "lottery": {
+            "price": db.LOTTERY_PRICE,
+            "odds": db.LOTTERY_ODDS,
+            "prize": db.LOTTERY_PRIZE,
+            "tickets": db.pending_tickets(conn, user_id),
+            "drawIn": db.next_draw_in(),
+        },
         "stats": {
             "wins": st["wins"],
             "losses": st["losses"],
@@ -2115,8 +2138,16 @@ def wallet_payload(conn, user_id):
 
 @route("GET", r"/api/wallet")
 def api_wallet(req):
+    """The wallet, plus any lottery result this player hasn't been told about.
+
+    The draw itself runs on a timer (see draw_loop) and is announced in every
+    server's #general. This is the personal half: a toast for the person who
+    won, handed over exactly once so it doesn't repeat on the next refresh.
+    """
     req.require_auth()
-    return wallet_payload(req.conn, req.user["id"])
+    payload = wallet_payload(req.conn, req.user["id"])
+    payload["lotteryResults"] = db.collect_results(req.conn, req.user["id"])
+    return payload
 
 
 def wait_text(seconds):
@@ -2218,9 +2249,19 @@ def api_work(req):
 def api_shop(req):
     req.require_auth()
     owned = db.perks_for(req.conn, req.user["id"])
+    held = db.pending_tickets(req.conn, req.user["id"])
     return {
-        "items": [{**item, "owned": item["id"] in owned} for item in db.SHOP_ITEMS],
+        "items": [
+            {
+                **item,
+                # A repeatable item is never "owned" — you can always buy more.
+                "owned": not item.get("repeatable") and item["id"] in owned,
+                "held": held if item["id"] == "lottery" else 0,
+            }
+            for item in db.SHOP_ITEMS
+        ],
         "coins": db.balance(req.conn, req.user["id"]),
+        "drawIn": db.next_draw_in(),
     }
 
 
@@ -2231,7 +2272,8 @@ def api_buy(req):
     item = db.SHOP_BY_ID.get(str(req.body.get("item") or "").lower())
     if not item:
         raise HttpError(404, "The Frontman doesn't sell that.")
-    if item["id"] in db.perks_for(req.conn, req.user["id"]):
+    repeatable = bool(item.get("repeatable"))
+    if not repeatable and item["id"] in db.perks_for(req.conn, req.user["id"]):
         raise HttpError(409, f"You already own the {item['name'].lower()}.")
 
     have = db.balance(req.conn, req.user["id"])
@@ -2246,10 +2288,22 @@ def api_buy(req):
             "UPDATE users SET coins = coins - ? WHERE id = ? AND coins >= ?",
             (item["price"], req.user["id"], item["price"]),
         )
-        req.conn.execute(
-            "INSERT INTO purchases (user_id, item, price, created_at) VALUES (?,?,?,?)",
-            (req.user["id"], item["id"], item["price"], db.now()),
-        )
+        if repeatable:
+            db.buy_ticket(req.conn, req.user["id"], item["price"])
+        else:
+            req.conn.execute(
+                "INSERT INTO purchases (user_id, item, price, created_at)"
+                " VALUES (?,?,?,?)",
+                (req.user["id"], item["id"], item["price"], db.now()),
+            )
+    if item.get("decoration"):
+        # Worn straight away — nobody buys a hat to leave it in the box.
+        with req.conn:
+            req.conn.execute(
+                "UPDATE users SET decoration = ? WHERE id = ?",
+                (item["id"], req.user["id"]),
+            )
+
     if item["id"] == "lounge":
         # The key is no use without a door: make sure every server they are in
         # has a lounge to walk into.
@@ -2407,16 +2461,24 @@ def api_leaderboard(req, guild_id):
 
 # --------------------------------------------------------------- games API
 
-def serialize_game(conn, row, viewer_id):
-    """Public view of a game, hiding what the viewer isn't allowed to see."""
+def serialize_game(conn, row, viewer_id, balance=None):
+    """Public view of a game, hiding what the viewer isn't allowed to see.
+
+    `balance` is the viewer's own, shown on the card beside the stake. It is
+    passed in where a whole channel is being serialized at once, so a page of
+    fifty hands doesn't do fifty identical lookups.
+    """
     state = json.loads(row["state"])
     mode, status = row["mode"], row["status"]
 
     if mode == "info":
         return {"id": row["id"], "mode": "info", "status": "finished", **state}
 
+    if balance is None:
+        balance = db.balance(conn, viewer_id)
+
     if mode == "poker":
-        return serialize_poker(conn, row, viewer_id)
+        return serialize_poker(conn, row, viewer_id, balance)
 
     if mode == "roulette":
         host = conn.execute("SELECT * FROM users WHERE id = ?", (row["host_id"],)).fetchone()
@@ -2432,6 +2494,7 @@ def serialize_game(conn, row, viewer_id):
             "payout": state["payout"],
             "profit": state["profit"],
             "label": state["label"],
+            "balance": balance,
             "player": public_user(conn, host) if host else None,
             "yourSeat": "host" if viewer_id == row["host_id"] else None,
         }
@@ -2447,6 +2510,7 @@ def serialize_game(conn, row, viewer_id):
             "label": state["label"],
             "payout": state["payout"],
             "profit": state["profit"],
+            "balance": balance,
             "player": public_user(conn, host) if host else None,
             "yourSeat": "host" if viewer_id == row["host_id"] else None,
         }
@@ -2523,6 +2587,7 @@ def serialize_game(conn, row, viewer_id):
         "mode": mode,
         "status": status,
         "bet": row["bet"],
+        "balance": balance,
         "seats": seats,
         "turn": state.get("turn"),
         "yourSeat": viewer_seat,
@@ -2692,7 +2757,9 @@ def save_game(req, row, state, status):
             "wallet": wallet_payload(req.conn, req.user["id"])}
 
 
-def serialize_poker(conn, row, viewer_id):
+def serialize_poker(conn, row, viewer_id, balance=None):
+    if balance is None:
+        balance = db.balance(conn, viewer_id)
     state = json.loads(row["state"])
     people = {}
     for p in state["players"]:
@@ -2747,6 +2814,7 @@ def serialize_poker(conn, row, viewer_id):
         "pot": state["pot"],
         "ante": ante,
         "bet": ante,
+        "balance": balance,
         "toMatch": state.get("toMatch", 0),
         # What this viewer must put in to keep playing: 0 means they can check.
         "toCall": poker.owed(state, me) if me else 0,
@@ -3370,6 +3438,101 @@ def api_user_profile(req, user_id):
     return {"user": payload}
 
 
+# ------------------------------------------------------------- the draw
+
+DRAW_CHECK_EVERY = 30.0     # seconds between "is a draw due?" checks
+
+
+def announcement_text(conn, draw):
+    """What the Frontman says in #general when a draw has run."""
+    winners = db.draw_winners(conn, draw["draw_at"])
+    entries = db.draw_entries(conn, draw["draw_at"])
+    tickets = entries["tickets"] or 0
+    players = entries["players"] or 0
+    pool = (f"{tickets} ticket{'' if tickets == 1 else 's'} from "
+            f"{players} {'person' if players == 1 else 'people'}")
+
+    if not winners:
+        return (f"@everyone Tonight's lottery: {pool}, and not one of them came "
+                f"up. The {db.LOTTERY_PRIZE:,} rolls over to nobody — it's a "
+                f"fresh {db.LOTTERY_ODDS} to 1 tomorrow. Tickets are "
+                f"{db.LOTTERY_PRICE:,} from /shop.")
+
+    # Winners are named by full tag, so they get a ping of their own on top of
+    # the @everyone. Long lists are capped — a message has a length limit.
+    if len(winners) == 1:
+        only = winners[0]
+        held = only["tickets"]
+        across = f" on {held} tickets" if held > 1 else ""
+        body = (f"@{only['username']}#{only['discriminator']} takes "
+                f"{only['won']:,}{across}")
+    else:
+        named = [f"@{w['username']}#{w['discriminator']} — {w['won']:,}"
+                 for w in winners[:8]]
+        more = "" if len(winners) <= 8 else f", and {len(winners) - 8} more"
+        body = "Winners: " + ", ".join(named) + more
+
+    return (f"@everyone Tonight's lottery is drawn — {pool}. {body}. "
+            f"Tickets for tomorrow are {db.LOTTERY_PRICE:,} from /shop.")
+
+
+def announce_draw(conn, draw):
+    """Post the result to every server's #general, as the Frontman."""
+    text = announcement_text(conn, draw)[:MAX_MESSAGE]
+    bot = db.bot_id(conn)
+    if not bot:
+        return
+    for guild in conn.execute("SELECT id FROM guilds").fetchall():
+        channel = conn.execute(
+            # #general by name, or the top of the list if a server hasn't got
+            # one. Never a locked channel: most people can't even see it.
+            "SELECT * FROM channels WHERE guild_id = ? AND kind = 'text'"
+            " AND locked = '' ORDER BY (name <> 'general'), position, id LIMIT 1",
+            (guild["id"],),
+        ).fetchone()
+        if not channel:
+            continue
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO messages (channel_id, author_id, content, created_at)"
+                " VALUES (?,?,?,?)",
+                (channel["id"], bot, text, db.now()),
+            )
+        # Without this the @everyone renders as a pill but pings nobody.
+        record_mentions(conn, channel, cur.lastrowid, text, bot)
+    db.mark_announced(conn, draw["draw_at"])
+
+
+def draw_tick(conn):
+    """Run a due draw, if there is one, and announce anything unannounced.
+
+    Announcing is a separate step from drawing so a crash between the two
+    doesn't swallow the result: the draw is recorded, and the next tick
+    finds it still unannounced and posts it.
+    """
+    due = db.due_draw(conn)
+    if due is not None:
+        db.run_draw(conn, due)
+    for draw in db.unannounced_draws(conn):
+        announce_draw(conn, draw)
+
+
+def draw_loop(stop):
+    """Watch the clock so the lottery is drawn at six whether or not anyone
+    is looking. A draw missed while the server was down runs on the next
+    boot — late, but never skipped."""
+    while not stop.wait(DRAW_CHECK_EVERY):
+        conn = None
+        try:
+            conn = db.connect()
+            draw_tick(conn)
+        except Exception as err:                       # never kill the thread
+            print(f"lottery draw failed: {err!r}", flush=True)
+        finally:
+            if conn:
+                conn.close()
+
+
 # --------------------------------------------------------------- HTTP layer
 
 class Handler(BaseHTTPRequestHandler):
@@ -3713,12 +3876,20 @@ def main():
             print("  Restart without --host 127.0.0.1 to let people in.")
     print()
     report_storage(existed)
+    draw_at = db.next_draw_at()
+    print(f"  Lottery draw:      {time.strftime('%H:%M', time.localtime(draw_at))}"
+          f" daily (next in {wait_text(db.next_draw_in())})")
     print(flush=True)
+
+    # Daemon, so Ctrl-C doesn't have to wait for it to come round again.
+    stop = threading.Event()
+    threading.Thread(target=draw_loop, args=(stop,), daemon=True).start()
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
+        stop.set()
         server.server_close()
 
 

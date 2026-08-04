@@ -208,6 +208,33 @@ CREATE TABLE IF NOT EXISTS purchases (
     UNIQUE (user_id, item)
 );
 
+-- Lottery tickets. One row per ticket, so buying ten is ten chances.
+-- `draw_at` is the moment of the draw the ticket is entered into, so a ticket
+-- bought after today's draw goes into tomorrow's.
+CREATE TABLE IF NOT EXISTS lottery_tickets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    draw_at    INTEGER NOT NULL,
+    price      INTEGER NOT NULL,
+    won        INTEGER NOT NULL DEFAULT 0,
+    drawn      INTEGER NOT NULL DEFAULT 0,
+    seen       INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lottery_user ON lottery_tickets(user_id, drawn);
+
+-- One row per draw that has actually run. The primary key is what stops a
+-- draw happening twice: whoever inserts the row first owns that draw, so a
+-- restart, a slow announcement or two threads can't pay the prize out twice.
+CREATE TABLE IF NOT EXISTS lottery_draws (
+    draw_at   INTEGER PRIMARY KEY,
+    ran_at    INTEGER NOT NULL,
+    tickets   INTEGER NOT NULL DEFAULT 0,
+    winners   INTEGER NOT NULL DEFAULT 0,
+    prize     INTEGER NOT NULL DEFAULT 0,
+    announced INTEGER NOT NULL DEFAULT 0
+);
+
 -- Muted channels. A row means "no badges and no chime from this channel";
 -- unread state itself is untouched, so unmuting restores the real counts.
 CREATE TABLE IF NOT EXISTS channel_mutes (
@@ -408,12 +435,192 @@ def record_result(conn, user_id, outcome, profit, wagered):
     )
 
 
+# ------------------------------------------------------------- the lottery
+
+LOTTERY_PRICE = 500
+LOTTERY_ODDS = 300              # one in this many tickets wins
+LOTTERY_PRIZE = 100_000
+
+# The draw runs at this hour, in the server's own time zone. Railway runs in
+# UTC, so set NEXUS_DRAW_HOUR if six o'clock there isn't six o'clock for you.
+DRAW_HOUR = max(0, min(23, int(os.environ.get("NEXUS_DRAW_HOUR", "18"))))
+
+
+def next_draw_at(ts=None):
+    """When the next draw happens: the next DRAW_HOUR at or after `ts`."""
+    ts = int(ts if ts is not None else now())
+    lt = time.localtime(ts)
+    at = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                          DRAW_HOUR, 0, 0, 0, 0, -1)))
+    if at <= ts:
+        # mktime normalises a day past the end of the month for us.
+        at = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1,
+                              DRAW_HOUR, 0, 0, 0, 0, -1)))
+    return at
+
+
+def next_draw_in(ts=None):
+    ts = int(ts if ts is not None else now())
+    return max(0, next_draw_at(ts) - ts)
+
+
+def buy_ticket(conn, user_id, price=LOTTERY_PRICE):
+    conn.execute(
+        "INSERT INTO lottery_tickets (user_id, draw_at, price, created_at)"
+        " VALUES (?,?,?,?)",
+        (user_id, next_draw_at(), price, now()),
+    )
+
+
+def pending_tickets(conn, user_id):
+    """This player's tickets waiting on the next draw."""
+    return conn.execute(
+        "SELECT COUNT(*) c FROM lottery_tickets WHERE user_id = ? AND drawn = 0",
+        (user_id,),
+    ).fetchone()["c"]
+
+
+def due_draw(conn):
+    """The draw that should have run by now and hasn't, or None."""
+    row = conn.execute(
+        "SELECT MIN(draw_at) d FROM lottery_tickets WHERE drawn = 0 AND draw_at <= ?",
+        (now(),),
+    ).fetchone()
+    return row["d"]
+
+
+def run_draw(conn, draw_at):
+    """Roll every ticket in one draw and pay the winners.
+
+    Each ticket is rolled on its own, so ten tickets are ten one-in-three-
+    hundred chances rather than one better chance. The roll happens here and
+    not at the counter, so a ticket can't be inspected before its draw.
+
+    Returns the draw's summary, or None if another caller got there first —
+    the primary key on lottery_draws is what makes that race safe.
+    """
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO lottery_draws (draw_at, ran_at) VALUES (?,?)",
+                (draw_at, now()),
+            )
+    except sqlite3.IntegrityError:
+        return None                       # somebody else is running this one
+
+    rows = conn.execute(
+        "SELECT id, user_id FROM lottery_tickets WHERE drawn = 0 AND draw_at <= ?",
+        (draw_at,),
+    ).fetchall()
+
+    rng = secrets.SystemRandom()
+    winners = {}
+    with conn:
+        for r in rows:
+            won = LOTTERY_PRIZE if rng.randrange(LOTTERY_ODDS) == 0 else 0
+            conn.execute(
+                "UPDATE lottery_tickets SET drawn = 1, won = ? WHERE id = ?",
+                (won, r["id"]),
+            )
+            if won:
+                winners[r["user_id"]] = winners.get(r["user_id"], 0) + won
+                adjust_coins(conn, r["user_id"], won)
+        conn.execute(
+            "UPDATE lottery_draws SET tickets = ?, winners = ?, prize = ?"
+            " WHERE draw_at = ?",
+            (len(rows), len(winners), sum(winners.values()), draw_at),
+        )
+    return {
+        "drawAt": draw_at,
+        "tickets": len(rows),
+        "winners": winners,             # {user_id: total won}
+    }
+
+
+def unannounced_draws(conn):
+    return conn.execute(
+        "SELECT * FROM lottery_draws WHERE announced = 0 ORDER BY draw_at"
+    ).fetchall()
+
+
+def mark_announced(conn, draw_at):
+    with conn:
+        conn.execute(
+            "UPDATE lottery_draws SET announced = 1 WHERE draw_at = ?", (draw_at,)
+        )
+
+
+def draw_winners(conn, draw_at):
+    """Who won a given draw, and how much."""
+    return conn.execute(
+        "SELECT t.user_id, u.username, u.discriminator, SUM(t.won) won,"
+        " COUNT(*) tickets FROM lottery_tickets t JOIN users u ON u.id = t.user_id"
+        " WHERE t.draw_at = ? AND t.won > 0 GROUP BY t.user_id"
+        " ORDER BY won DESC, u.username COLLATE NOCASE",
+        (draw_at,),
+    ).fetchall()
+
+
+def draw_entries(conn, draw_at):
+    """How many tickets and how many people were in a draw."""
+    return conn.execute(
+        "SELECT COUNT(*) tickets, COUNT(DISTINCT user_id) players"
+        " FROM lottery_tickets WHERE draw_at = ?",
+        (draw_at,),
+    ).fetchone()
+
+
+def collect_results(conn, user_id):
+    """Settled tickets the owner hasn't been told about yet, marked as told."""
+    rows = conn.execute(
+        "SELECT id, won FROM lottery_tickets"
+        " WHERE user_id = ? AND drawn = 1 AND seen = 0 ORDER BY id",
+        (user_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    with conn:
+        conn.execute(
+            "UPDATE lottery_tickets SET seen = 1 WHERE user_id = ? AND drawn = 1",
+            (user_id,),
+        )
+    won = sum(r["won"] for r in rows)
+    return {
+        "tickets": len(rows),
+        "winners": sum(1 for r in rows if r["won"]),
+        "won": won,
+    }
+
+
 # ---------------------------------------------------------------- the shop
 
 # Perks are permanent and deliberately expensive: at 5,000 a day from /claim
 # and 500 an hour from /work, the cheapest is a fortnight of showing up and the
 # Sana Lounge is something you win at the tables rather than wait for.
 SHOP_ITEMS = [
+    {
+        "id": "lottery",
+        "name": "Lottery ticket",
+        "price": LOTTERY_PRICE,
+        "icon": "🎟",
+        # The only thing on the shelf you can buy twice, and the only one that
+        # might be worth nothing in the morning.
+        "repeatable": True,
+        "summary": f"One in {LOTTERY_ODDS} wins {LOTTERY_PRIZE:,}.",
+        "detail": "Drawn once a day. Buy as many as you like — each one is its "
+                  "own chance.",
+    },
+    {
+        "id": "fedora",
+        "name": "Fedora",
+        "price": 10_000,
+        "icon": "🎩",
+        # The one perk you can put away: it sits on the avatar rather than
+        # changing how a name is drawn, and taste varies.
+        "decoration": True,
+        "summary": "A hat that sits on top of your avatar.",
+        "detail": "Take it off or put it back on any time in Settings.",
+    },
     {
         "id": "glow",
         "name": "Glowing nameplate",
@@ -626,6 +833,11 @@ def migrate(conn):
         conn.execute("ALTER TABLE users ADD COLUMN last_claim INTEGER NOT NULL DEFAULT 0")
     if "last_work" not in have:
         conn.execute("ALTER TABLE users ADD COLUMN last_work INTEGER NOT NULL DEFAULT 0")
+    if "decoration" not in have:
+        # What they are wearing on their avatar, or '' for nothing. Separate
+        # from owning it: the hat comes off in settings and goes back on
+        # without buying it again.
+        conn.execute("ALTER TABLE users ADD COLUMN decoration TEXT NOT NULL DEFAULT ''")
     if "work_shifts" not in have:
         # Hours on the clock, which is what earns the 20% rises.
         conn.execute("ALTER TABLE users ADD COLUMN work_shifts INTEGER NOT NULL DEFAULT 0")
@@ -743,10 +955,16 @@ def avatar_url(row):
     return f"/uploads/{name}" if name else None
 
 
+def decoration_of(row):
+    keys = row.keys()
+    return row["decoration"] if "decoration" in keys and row["decoration"] else ""
+
+
 def public_user(row, online=False, perks=()):
     return {
         "id": row["id"],
         "perks": sorted(perks),
+        "decoration": decoration_of(row),
         "username": row["username"],
         "discriminator": row["discriminator"],
         "tag": f'{row["username"]}#{row["discriminator"]}',

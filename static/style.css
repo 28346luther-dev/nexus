@@ -519,8 +519,13 @@ button { background:none; border:0; cursor:pointer; }
 .game-card.waiting  { border-left-color:var(--yellow); }
 .game-card.finished { border-left-color:var(--text-mute); }
 
-.game-head { display:flex; align-items:baseline; gap:10px; margin-bottom:12px; }
-.game-title { font-weight:700; color:#8ea1ff; font-size:15px; }
+/* Wraps rather than squeezing: title, stake, balance and status is a lot to
+   fit on one line in a narrow window, and a squashed title reads worst. */
+.game-head {
+  display:flex; align-items:baseline; gap:10px; margin-bottom:12px;
+  flex-wrap:wrap; row-gap:6px;
+}
+.game-title { font-weight:700; color:#8ea1ff; font-size:15px; white-space:nowrap; }
 .game-card.waiting .game-title  { color:#f8c57a; }
 .game-card.finished .game-title { color:var(--text-dim); }
 .game-status { font-size:12.5px; color:var(--text-mute); margin-left:auto; }
@@ -737,7 +742,16 @@ button { background:none; border:0; cursor:pointer; }
 .shop-text strong { display:block; font-size:14.5px; }
 .shop-text .muted { font-size:13px; }
 .shop-detail { display:block; margin-top:3px; color:var(--text-mute); font-size:11.5px; }
+.shop-held { display:block; margin-top:4px; color:var(--yellow); font-size:11.5px; }
 .shop-item .btn { flex:none; }
+
+/* What the viewer is holding, beside the stake on a gambling card. */
+.game-balance {
+  display:inline-flex; align-items:baseline; gap:4px; font-size:11.5px;
+  background:var(--bg-0); border-radius:10px; padding:1px 8px; flex:none;
+}
+.gb-label { color:var(--text-mute); }
+.gb-value { font-weight:650; color:var(--text); }
 
 /* ------------------------------------------------------------- shop perks */
 /* Kept to a text-shadow so it works over any name colour the user picked. */
@@ -772,6 +786,18 @@ button { background:none; border:0; cursor:pointer; }
 @media (prefers-reduced-motion:reduce) {
   .avatar.ringed::before, .name-text.glow { animation:none; }
 }
+
+/* Avatar decorations. Sized in percentages so one rule covers every avatar
+   size, and pointer-events off so the hat never eats a click meant for the
+   face underneath. */
+.decoration {
+  position:absolute; left:-16%; width:132%; bottom:74%;
+  pointer-events:none; line-height:0;
+}
+.decoration svg { width:100%; height:auto; display:block;
+                  filter:drop-shadow(0 1px 2px rgba(0,0,0,.5)); }
+/* The brim overlaps the top of the circle, the way a hat would sit. */
+.decoration.fedora { bottom:66%; }
 
 .m-name, .rank-name { font-size:14.5px; }
 .rank-name { display:flex; font-weight:650; }

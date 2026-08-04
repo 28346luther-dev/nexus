@@ -131,6 +131,7 @@ platform's health check at it.
 | `NEXUS_DB`      | `./data.db`          | Database location. Point at your volume in prod.  |
 | `NEXUS_UPLOADS` | next to `NEXUS_DB`   | Where uploaded images are written.                |
 | `GIPHY_API_KEY` | unset                | Enables `/gif`. Without it the picker says so.    |
+| `NEXUS_DRAW_HOUR` | `18`               | Hour of the daily lottery draw, server local time.|
 
 ### Turning on GIFs
 
@@ -214,8 +215,10 @@ ever posted survive the change.
 Leave the bet off and you get a **"How much would you like to bet?"** dialog
 with quick amounts, All in, and a For fun option.
 
-**Sana Coin** — everyone starts with 2,000. Stakes are held out of your balance
-when a hand starts and paid out exactly once. Ranks (Rookie → Chancer →
+**Sana Coin** — everyone starts with 2,000. Every gambling card carries a
+**Balance:** figure beside the stake, so you can see what you are holding
+without leaving the hand. Stakes are held out of your balance when a hand
+starts and paid out exactly once. Ranks (Rookie → Chancer →
 Hustler → Sharp → High Roller → Sana Legend) come from **wins, not balance**,
 so they can't simply be bought.
 
@@ -264,12 +267,14 @@ outside bet, which is where the house edge lives.
 
 ### The shop
 
-`/shop` sells six things, permanently and without refunds. Prices are steep on
-purpose — the cheapest is a fortnight of showing up, and the Sana Lounge is
-something you win at the tables.
+`/shop` sells eight things. Everything but the lottery ticket is permanent,
+one to a customer, and non-refundable. Prices are steep on purpose — the Sana
+Lounge is something you win at the tables, not something you save up for.
 
-| Perk | Price | What it does |
+| Item | Price | What it does |
 |---|---|---|
+| Lottery ticket | 500 | One in 300 wins 100,000. Buy as many as you like |
+| Fedora | 10,000 | A hat on your avatar. Off and on again in Settings |
 | Glowing nameplate | 100,000 | Your name glows in chat, the member list and every leaderboard |
 | VIP badge | 150,000 | A gold VIP tag beside your name |
 | Prismatic ring | 200,000 | An animated ring around your avatar |
@@ -281,6 +286,23 @@ The **Sana Lounge** appears in every server you are in, now and later, and only
 for people who hold a key — **not even the server owner can see it** without
 one, and it can't be deleted or dragged around. `/reset` levels balances and
 records but leaves perks alone: they were paid for.
+
+The **fedora** is the one thing you can put away. It sits on your avatar
+wherever the avatar appears, and the toggle in *Settings* takes it off and puts
+it back without you buying it again.
+
+### The lottery
+
+Tickets are **500** each and there is no limit: ten tickets are ten separate
+one-in-three-hundred chances, not one better one. The draw runs **once a day at
+six**, and the Frontman posts the result to every server's `#general` with an
+`@everyone` — winners are named by tag, so they get a ping of their own too.
+
+The draw is a background thread rather than a lazy check, so it happens at six
+whether or not anyone is looking. If the server is down at six, the draw runs
+on the next boot — late, but never skipped, and never twice: the first writer
+of the draw row owns it. Six o'clock means the **server's** local time, which
+on Railway is UTC; set `NEXUS_DRAW_HOUR` to move it.
 
 **GIFs** — the **GIF** button in the message bar, or `/gif <search>`, opens a
 Giphy picker. Tap ★ on any GIF to keep it,

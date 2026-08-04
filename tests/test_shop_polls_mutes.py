@@ -1,6 +1,8 @@
-"""The shop and its perks, /reset, muted channels and polls."""
+"""The shop and its perks, the lottery, /reset, muted channels and polls."""
 import json
+import sqlite3
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -62,7 +64,6 @@ def channels_of(client, guild_id):
 
 def stack_the_deck(client, coins):
     """Sitting on a lot of Sana Coin without playing 200 hands for it."""
-    import sqlite3
     conn = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE users SET coins = ? WHERE id = ?", (coins, client.uid))
     conn.commit()
@@ -161,6 +162,89 @@ check("the gold pass can be bought", s == 200, r)
 check("the gold pass doubles the daily claim",
       r["wallet"]["dailyAmount"] == 10_000, r["wallet"])
 check("the gold pass doubles the shift", r["wallet"]["workPay"] == 1000, r["wallet"])
+
+# ================================================================== fedora
+s, me = member.call("GET", "/api/me")
+check("nothing is worn to begin with", me["user"]["decoration"] == "", me["user"])
+s, r = member.call("PATCH", "/api/me", {"decoration": "fedora"})
+check("you can't wear a hat you haven't bought", s == 403, (s, r))
+
+s, r = member.call("POST", "/api/shop/buy", {"item": "fedora"})
+check("the fedora is 10,000", s == 200 and r["item"]["price"] == 10_000, r)
+s, me = member.call("GET", "/api/me")
+check("the hat goes on as soon as it's bought",
+      me["user"]["decoration"] == "fedora", me["user"])
+
+s, r = member.call("PATCH", "/api/me", {"decoration": ""})
+check("it comes off in settings", r["user"]["decoration"] == "", r["user"])
+s, r = member.call("PATCH", "/api/me", {"decoration": "fedora"})
+check("and goes back on", r["user"]["decoration"] == "fedora", r["user"])
+check("taking it off doesn't lose it", "fedora" in r["user"]["perks"], r["user"])
+
+s, r = member.call("PATCH", "/api/me", {"decoration": "glow"})
+check("a perk that isn't a hat can't be worn", s == 400, (s, r))
+
+member.call("POST", f"/api/channels/{cid}/messages", {"content": "hat on"})
+_, r = owner.call("GET", f"/api/channels/{cid}/messages")
+hatted = [m for m in r["messages"] if m["author"]["id"] == member.uid][-1]
+check("everyone sees the hat", hatted["author"]["decoration"] == "fedora",
+      hatted["author"])
+
+# ================================================================= lottery
+s, r = member.call("GET", "/api/shop")
+ticket = next(i for i in r["items"] if i["id"] == "lottery")
+check("the shop sells lottery tickets", ticket["price"] == 500, ticket)
+check("a ticket is never 'owned'", ticket["owned"] is False, ticket)
+check("the shop counts down to the draw", r["drawIn"] > 0, r)
+
+_, before = member.call("GET", "/api/wallet")
+check("no tickets to begin with", before["lottery"]["tickets"] == 0, before["lottery"])
+check("the wallet quotes the odds",
+      before["lottery"]["odds"] == 300 and before["lottery"]["prize"] == 100_000,
+      before["lottery"])
+
+s, r = member.call("POST", "/api/shop/buy", {"item": "lottery"})
+check("a ticket can be bought", s == 200, r)
+check("the ticket is paid for", r["wallet"]["coins"] == before["coins"] - 500,
+      (before["coins"], r["wallet"]["coins"]))
+s, r = member.call("POST", "/api/shop/buy", {"item": "lottery"})
+check("tickets can be bought again and again", s == 200, r)
+check("tickets stack up", r["wallet"]["lottery"]["tickets"] == 2, r["wallet"]["lottery"])
+
+_, r = member.call("GET", "/api/shop")
+ticket = next(i for i in r["items"] if i["id"] == "lottery")
+check("the shop shows how many you hold", ticket["held"] == 2, ticket)
+
+# Drag the draw into the past — the live server has a thread that does this at
+# six, which is no use to a test that runs at noon.
+conn = sqlite3.connect(DB_PATH)
+conn.execute("UPDATE lottery_tickets SET draw_at = ? WHERE drawn = 0",
+             (int(time.time()) - 10,))
+conn.commit()
+conn.close()
+
+for _ in range(40):                    # the thread checks every 30 seconds
+    time.sleep(1)
+    _, r = member.call("GET", "/api/wallet")
+    if r["lottery"]["tickets"] == 0:
+        break
+check("the draw runs on its own", r["lottery"]["tickets"] == 0, r["lottery"])
+check("the result comes back once", r["lotteryResults"] is not None, r)
+if r["lotteryResults"]:
+    check("both tickets were drawn", r["lotteryResults"]["tickets"] == 2,
+          r["lotteryResults"])
+_, again = member.call("GET", "/api/wallet")
+check("and is not repeated", again["lotteryResults"] is None, again)
+
+_, msgs = member.call("GET", f"/api/channels/{cid}/messages")
+draws = [m for m in msgs["messages"]
+         if m["author"]["isBot"] and "lottery" in (m["content"] or "")]
+check("the Frontman announces the draw in the channel", len(draws) >= 1, draws)
+if draws:
+    check("the announcement pings everyone",
+          "@everyone" in draws[-1]["content"], draws[-1]["content"])
+    check("everyone is actually pinged by it", draws[-1]["mentionsMe"] is True,
+          draws[-1])
 
 # =================================================================== mutes
 chans = channels_of(member, gid)

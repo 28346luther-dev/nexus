@@ -4,6 +4,7 @@
 """
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -51,6 +52,33 @@ check("shop ids are unique",
       len({i["id"] for i in db.SHOP_ITEMS}) == len(db.SHOP_ITEMS))
 check("the nameplate is 100,000", db.SHOP_BY_ID["glow"]["price"] == 100_000)
 check("the lounge is 1,000,000", db.SHOP_BY_ID["lounge"]["price"] == 1_000_000)
+check("only the lottery ticket can be bought twice",
+      [i["id"] for i in db.SHOP_ITEMS if i.get("repeatable")] == ["lottery"],
+      [i["id"] for i in db.SHOP_ITEMS if i.get("repeatable")])
+
+# ---------------------------------------------------------------- lottery
+check("a ticket is 500", db.LOTTERY_PRICE == 500)
+check("the odds are one in 300", db.LOTTERY_ODDS == 300)
+check("the prize is 100,000", db.LOTTERY_PRIZE == 100_000)
+check("the shop sells the ticket at the same price",
+      db.SHOP_BY_ID["lottery"]["price"] == db.LOTTERY_PRICE)
+
+draw = db.next_draw_at()
+check("the draw lands on the hour",
+      time.localtime(draw).tm_hour == db.DRAW_HOUR
+      and time.localtime(draw).tm_min == 0,
+      time.strftime("%H:%M", time.localtime(draw)))
+check("the next draw is in the future", draw > time.time())
+check("the next draw is within a day", draw - time.time() <= 86400 + 3600)
+check("a ticket bought after the draw goes into the next one",
+      db.next_draw_at(draw + 60) > draw, db.next_draw_at(draw + 60))
+check("a ticket bought before it makes this one",
+      db.next_draw_at(draw - 60) == draw)
+check("draws are a day apart",
+      23 * 3600 <= db.next_draw_at(draw + 60) - draw <= 25 * 3600,
+      db.next_draw_at(draw + 60) - draw)
+check("the countdown agrees with the clock",
+      abs(db.next_draw_in() - (draw - int(time.time()))) <= 1)
 
 # --------------------------------------------------------------- roulette
 check("the wheel has 37 pockets", roulette.POCKETS == 37)
