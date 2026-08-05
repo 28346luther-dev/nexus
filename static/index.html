@@ -38,6 +38,13 @@
           <small>You'll get a #0000 tag so friends can find you.</small>
         </label>
 
+        <label class="field" id="field-fullname">
+          <span>Your name</span>
+          <input name="fullName" type="text" maxlength="80" autocomplete="name"
+                 placeholder="Alex Sawyer">
+          <small>For verification. Only an administrator sees this.</small>
+        </label>
+
         <label class="field">
           <span>Email</span>
           <input name="email" type="email" required autocomplete="email"
@@ -59,6 +66,27 @@
         <button class="linkbtn" id="auth-switch-btn">Create one</button>
       </p>
     </div>
+  </div>
+</div>
+
+<!-- ======================= WAITING FOR APPROVAL ======================= -->
+<div id="pending" class="pending hidden">
+  <div class="pending-card">
+    <div class="pending-mark">◈</div>
+    <h1 id="pending-title">Thanks for joining</h1>
+    <p id="pending-text">
+      Thanks for joining our learning resource manager. We will approve you
+      shortly.
+    </p>
+    <div class="pending-wait" id="pending-wait">
+      <span class="mini-spinner"></span>
+      <span>Waiting for an administrator…</span>
+    </div>
+    <p class="muted" id="pending-note">
+      You can close this page. Sign back in any time and you'll come straight
+      in once you've been approved.
+    </p>
+    <button class="btn ghost" id="pending-signout">Sign out</button>
   </div>
 </div>
 

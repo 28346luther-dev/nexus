@@ -802,6 +802,36 @@ button { background:none; border:0; cursor:pointer; }
 .m-name, .rank-name { font-size:14.5px; }
 .rank-name { display:flex; font-weight:650; }
 
+/* ------------------------------------------------- waiting for approval */
+.pending { position:fixed; inset:0; display:grid; place-items:center; padding:24px;
+           background:var(--bg-2); z-index:250; overflow-y:auto; }
+.pending-card {
+  max-width:460px; text-align:center; background:var(--bg-1);
+  border:1px solid var(--line); border-radius:14px; padding:36px 32px;
+  box-shadow:0 20px 60px rgba(0,0,0,.45);
+}
+.pending-mark { font-size:34px; color:var(--accent); margin-bottom:12px; }
+.pending-card h1 { font-size:24px; letter-spacing:-.5px; margin-bottom:10px; }
+.pending-card p { color:var(--text-dim); font-size:14.5px; line-height:1.55; }
+.pending-wait {
+  display:flex; align-items:center; justify-content:center; gap:10px;
+  margin:22px 0 16px; color:var(--text-mute); font-size:13.5px;
+}
+.pending-card .muted { font-size:12.5px; margin-bottom:20px; }
+
+/* ------------------------------------------------------ approval cards */
+.signup-card {
+  margin-top:6px; max-width:520px; background:var(--bg-1);
+  border-left:4px solid var(--yellow); border-radius:6px; padding:14px 16px;
+}
+.signup-card.approved { border-left-color:var(--green); }
+.signup-card.declined { border-left-color:var(--text-mute); }
+.signup-card .game-title { color:#f8c57a; }
+.signup-card.approved .game-title { color:#8ce0a8; }
+.signup-card.declined .game-title { color:var(--text-dim); }
+.signup-card .wallet-top strong { font-size:15px; }
+.signup-card .wallet-top small { display:block; margin-top:2px; font-size:11.5px; }
+
 /* --------------------------------------------------------------- polls */
 .poll-card {
   margin-top:6px; max-width:520px; background:var(--bg-1);

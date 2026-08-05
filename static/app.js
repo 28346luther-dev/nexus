@@ -237,7 +237,9 @@ function setAuthMode(mode) {
   document.querySelectorAll('.tab').forEach((t) =>
     t.classList.toggle('active', t.dataset.mode === mode));
   $('#field-username').classList.toggle('hidden', !registering);
+  $('#field-fullname').classList.toggle('hidden', !registering);
   $('#auth-form').username.required = registering;
+  $('#auth-form').fullName.required = registering;
   $('#auth-submit').textContent = registering ? 'Create account' : 'Sign in';
   $('#auth-form').password.autocomplete = registering ? 'new-password' : 'current-password';
   $('#auth-switch-text').textContent = registering ? 'Already registered?' : 'Need an account?';
@@ -262,11 +264,16 @@ $('#auth-form').onsubmit = async (e) => {
       email: form.email.value,
       password: form.password.value,
     };
-    if (authMode === 'register') payload.username = form.username.value;
+    if (authMode === 'register') {
+      payload.username = form.username.value;
+      payload.fullName = form.fullName.value;
+    }
     const data = await api('POST', `/api/${authMode}`, payload);
     state.me = data.user;
     form.reset();
-    await enterApp();
+    // A new account is held until an administrator lets it in.
+    if (!data.user.approved) showPending();
+    else await enterApp();
   } catch (err) {
     $('#auth-error').textContent = err.message;
   } finally {
@@ -617,8 +624,8 @@ function renderMessages() {
 }
 
 function messageNode(m, grouped) {
-  // Replies, game cards and polls always show their own header.
-  if (m.replyToId || m.game || m.poll) grouped = false;
+  // Replies and cards always show their own header.
+  if (m.replyToId || m.game || m.poll || m.signup) grouped = false;
   const node = el('div', `msg ${grouped ? 'grouped' : ''}`.trim());
   node.dataset.id = m.id;
   if (m.mentionsMe) node.classList.add('pinged');
@@ -656,6 +663,7 @@ function messageNode(m, grouped) {
   if (gifUrl) body.appendChild(gifNode(gifUrl));
 
   if (m.game) body.appendChild(gameNode(m));
+  if (m.signup) body.appendChild(signupNode(m));
   if (m.poll) body.appendChild(pollNode(m));
   if (m.sticker) body.appendChild(stickerNode(m.sticker));
   (m.attachments || []).forEach((a) => body.appendChild(attachmentNode(a)));
@@ -1334,6 +1342,67 @@ function gameNode(m) {
   const hostName = g.seats.host.user ? g.seats.host.user.username : 'someone';
   foot.textContent = `${hostName}'s game`;
   card.appendChild(foot);
+  return card;
+}
+
+// --------------------------------------------------------------- approvals
+
+const SIGNUP_WORD = { approved: 'Approved', declined: 'Declined', pending: 'Waiting' };
+
+function signupNode(m) {
+  const a = m.signup;
+  const card = el('div', `signup-card ${a.status}`);
+
+  const head = el('div', 'game-head');
+  head.appendChild(el('span', 'game-title', 'New sign-up'));
+  head.appendChild(el('span', 'game-status', SIGNUP_WORD[a.status] || a.status));
+  card.appendChild(head);
+
+  if (!a.user) {
+    card.appendChild(el('p', 'muted', 'That account no longer exists.'));
+    return card;
+  }
+
+  const top = el('div', 'wallet-top');
+  top.appendChild(avatar({ ...a.user, online: undefined }, 'lg'));
+  const meta = el('div');
+  // The real name leads: it's what the admin is actually checking.
+  meta.appendChild(el('strong', null, a.user.fullName || a.user.username));
+  meta.appendChild(el('div', 'muted', `${a.user.tag} · ${a.user.email}`));
+  meta.appendChild(el('small', 'muted', `Applied ${stampLabel(a.createdAt)}`));
+  top.appendChild(meta);
+  card.appendChild(top);
+
+  if (a.canDecide) {
+    const actions = el('div', 'game-actions');
+    const yes = el('button', 'btn primary small', 'Approve');
+    const no = el('button', 'btn small danger', 'Decline');
+    const decide = async (verdict, button) => {
+      [yes, no].forEach((b) => { b.disabled = true; });
+      try {
+        const data = await api('POST', `/api/signups/${a.id}/decide`, { verdict });
+        if (data.message) replaceMessage(data.message);
+        toast(verdict === 'approve'
+          ? `${a.user.username} is in.`
+          : `${a.user.username} was turned away.`, 'ok');
+      } catch (err) {
+        toast(err.message, 'error');
+        [yes, no].forEach((b) => { b.disabled = false; });
+      }
+    };
+    yes.onclick = () => decide('approve', yes);
+    no.onclick = () => decide('decline', no);
+    actions.append(yes, no);
+    card.appendChild(actions);
+  } else if (a.status !== 'pending') {
+    const banner = el('div', `game-result ${a.status === 'approved' ? 'win' : 'lose'}`);
+    banner.appendChild(el('strong', null,
+      a.status === 'approved' ? 'Let in' : 'Turned away'));
+    banner.appendChild(el('span', null,
+      `${a.decidedBy || 'An administrator'} decided${
+        a.decidedAt ? ` ${stampLabel(a.decidedAt)}` : ''}.`));
+    card.appendChild(banner);
+  }
   return card;
 }
 
@@ -4407,11 +4476,69 @@ function renderMe() {
 
 function showAuth() {
   stopPoll();
+  stopApprovalWatch();
   $('#app').classList.add('hidden');
+  $('#pending').classList.add('hidden');
   $('#auth').classList.remove('hidden');
   $('#boot').classList.add('hidden');
   setAuthMode('login');
 }
+
+// ------------------------------------------------------ waiting to be let in
+
+let approvalTimer = null;
+
+function stopApprovalWatch() {
+  if (approvalTimer) { clearInterval(approvalTimer); approvalTimer = null; }
+}
+
+/** The holding screen for an account nobody has approved yet. */
+function showPending() {
+  stopPoll();
+  $('#app').classList.add('hidden');
+  $('#auth').classList.add('hidden');
+  $('#boot').classList.add('hidden');
+  $('#pending').classList.remove('hidden');
+
+  const declined = state.me && state.me.signupStatus === 'declined';
+  $('#pending-title').textContent = declined
+    ? 'We couldn’t let you in' : 'Thanks for joining';
+  $('#pending-text').textContent = declined
+    ? 'An administrator has reviewed your application and turned it down. '
+      + 'If you think that’s a mistake, speak to whoever runs this site.'
+    : 'Thanks for joining our learning resource manager. We will approve you '
+      + 'shortly.';
+  $('#pending-wait').hidden = declined;
+  $('#pending-note').hidden = declined;
+
+  // Nothing pushes to an account that can't poll, so check back periodically.
+  // The moment they're approved they land in the app without touching a thing.
+  stopApprovalWatch();
+  if (!declined) {
+    approvalTimer = setInterval(async () => {
+      try {
+        const data = await api('GET', '/api/me');
+        if (!data.user) return showAuth();
+        state.me = data.user;
+        if (data.user.approved) {
+          stopApprovalWatch();
+          $('#pending').classList.add('hidden');
+          toast('You’re in. Welcome.', 'ok');
+          await enterApp();
+        } else if (data.user.signupStatus === 'declined') {
+          showPending();
+        }
+      } catch { /* try again on the next tick */ }
+    }, 5000);
+  }
+}
+
+$('#pending-signout').onclick = async () => {
+  stopApprovalWatch();
+  try { await api('POST', '/api/logout'); } catch { /* going anyway */ }
+  state.me = null;
+  showAuth();
+};
 
 async function enterApp() {
   $('#auth').classList.add('hidden');
@@ -4493,6 +4620,10 @@ async function handleInviteLink(code) {
   }
 
   state.me = data.user;
+  if (!data.user.approved) {
+    showPending();
+    return;
+  }
   try {
     await enterApp();
   } catch (err) {

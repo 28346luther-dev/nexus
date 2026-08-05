@@ -361,6 +361,20 @@ def serialize_messages(conn, rows, user_id):
             if g:
                 m["game"] = serialize_game(conn, g, user_id, purse)
 
+    signup_ids = [m["signupId"] for m in out if m["signupId"]]
+    if signup_ids:
+        amarks = ",".join("?" * len(signup_ids))
+        applications = {
+            a["id"]: a
+            for a in conn.execute(
+                f"SELECT * FROM signups WHERE id IN ({amarks})", signup_ids
+            )
+        }
+        for m in out:
+            a = applications.get(m["signupId"])
+            if a:
+                m["signup"] = serialize_signup(conn, a, user_id)
+
     poll_ids = [m["pollId"] for m in out if m["pollId"]]
     if poll_ids:
         pmarks = ",".join("?" * len(poll_ids))
@@ -414,6 +428,8 @@ def serialize_message(row):
         "game": None,
         "pollId": row["poll_id"] if "poll_id" in keys else None,
         "poll": None,
+        "signupId": row["signup_id"] if "signup_id" in keys else None,
+        "signup": None,
         "mentionsMe": False,
         "attachments": [],
         "reactions": [],
@@ -538,8 +554,15 @@ def channel_revision(conn, channel_id):
         " WHERE p.channel_id = ?",
         (channel_id,),
     ).fetchone()
+    # An approval changes a signups row, not the message that renders it, so a
+    # second admin's copy of the card would otherwise never catch up.
+    a = conn.execute(
+        "SELECT COALESCE(SUM(s.decided_at), 0) v FROM signups s"
+        " JOIN messages m ON m.signup_id = s.id WHERE m.channel_id = ?",
+        (channel_id,),
+    ).fetchone()
     return (f"{m['a']}.{m['b']}.{m['c']}-{r['a']}.{r['b']}-{g['a']}.{g['b']}"
-            f"-{p['a']}.{p['b']}.{p['c']}")
+            f"-{p['a']}.{p['b']}.{p['c']}-{a['v']}")
 
 
 # ------------------------------------------------------------------ auth API
@@ -549,9 +572,16 @@ def api_register(req):
     username = req.field("username", maxlen=32)
     email = req.field("email", maxlen=254)
     password = req.field("password", maxlen=200)
+    # The real name is asked for so an admin can verify who is applying, so it
+    # is required exactly when somebody is going to check it.
+    full_name = db.clean_name(
+        req.field("fullName", required=not db.OPEN_SIGNUP, maxlen=80, default="")
+    )
 
     if not db.USERNAME_RE.match(username):
         raise HttpError(400, "Usernames are 2–32 characters: letters, numbers, spaces, . _ -")
+    if not db.OPEN_SIGNUP and len(full_name) < 2:
+        raise HttpError(400, "Please give the name you go by, for verification.")
     if not db.EMAIL_RE.match(email):
         raise HttpError(400, "That email address doesn't look valid.")
     if len(password) < 8:
@@ -564,8 +594,65 @@ def api_register(req):
         raise HttpError(409, "An account with that email already exists.")
 
     with req.conn:
-        user_id = db.create_user(req.conn, username, email, password)
+        user_id, approved = db.create_user(req.conn, username, email, password, full_name)
+        # The admin can hardly wait for the admin to approve them. This also
+        # covers a fresh deploy where their account doesn't exist yet: without
+        # it they would sign up into a queue nobody could clear.
+        if email.lower() == db.ADMIN_EMAIL:
+            req.conn.execute(
+                "UPDATE users SET approved = 1, is_admin = 1 WHERE id = ?", (user_id,)
+            )
+            approved = True
+        if not approved:
+            db.create_signup(req.conn, user_id)
+    if not approved:
+        notify_admins(req.conn, user_id)
     return start_session(req, user_id)
+
+
+def notify_admins(conn, user_id):
+    """The Frontman DMs every admin a card they can approve from.
+
+    A DM rather than a channel post: it lands with an unread badge wherever
+    they are, and nobody else can see who has applied.
+    """
+    signup = db.signup_for(conn, user_id)
+    if not signup:
+        return
+    bot = db.bot_id(conn)
+    if not bot:
+        return
+    for admin in db.admin_ids(conn):
+        channel_id = bot_dm_channel(conn, bot, admin)
+        with conn:
+            conn.execute(
+                "INSERT INTO messages (channel_id, author_id, content, created_at,"
+                " signup_id) VALUES (?,?,'',?,?)",
+                (channel_id, bot, db.now(), signup["id"]),
+            )
+
+
+def bot_dm_channel(conn, bot_id, user_id):
+    """The DM between the bot and someone, opened if it isn't already."""
+    existing = conn.execute(
+        "SELECT p1.channel_id id FROM dm_participants p1"
+        " JOIN dm_participants p2 ON p1.channel_id = p2.channel_id"
+        " WHERE p1.user_id = ? AND p2.user_id = ?",
+        (bot_id, user_id),
+    ).fetchone()
+    if existing:
+        return existing["id"]
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO channels (guild_id, kind, name, created_at)"
+            " VALUES (NULL,'dm','',?)",
+            (db.now(),),
+        )
+        conn.executemany(
+            "INSERT INTO dm_participants (channel_id, user_id) VALUES (?,?)",
+            [(cur.lastrowid, bot_id), (cur.lastrowid, user_id)],
+        )
+    return cur.lastrowid
 
 
 @route("POST", r"/api/login")
@@ -590,7 +677,8 @@ def start_session(req, user_id):
         req.conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (db.now(), user_id))
     req.set_cookie = token
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]),
+                               signup_state(req.conn, row))}
 
 
 @route("POST", r"/api/logout")
@@ -603,9 +691,24 @@ def api_logout(req):
     return {"ok": True}
 
 
-def me_payload(row, perks=()):
+def signup_state(conn, row):
+    """'pending' or 'declined' while an account is waiting or refused.
+
+    None once they are in, so the app never carries it around.
+    """
+    if row["approved"]:
+        return None
+    signup = db.signup_for(conn, row["id"])
+    return signup["status"] if signup else "pending"
+
+
+def me_payload(row, perks=(), signup_status=None):
     return {
         "id": row["id"],
+        "fullName": row["full_name"] if "full_name" in row.keys() else "",
+        # Only set while they are waiting or have been turned down; the app
+        # proper never needs it.
+        "signupStatus": signup_status,
         "perks": sorted(perks),
         "username": row["username"],
         "discriminator": row["discriminator"],
@@ -615,6 +718,8 @@ def me_payload(row, perks=()):
         "bio": row["bio"],
         "status": row["status"],
         "decoration": db.decoration_of(row),
+        "approved": bool(row["approved"]),
+        "isAdmin": bool(row["is_admin"]),
         "avatarUrl": db.avatar_url(row),
     }
 
@@ -624,7 +729,8 @@ def api_me(req):
     if not req.user:
         return {"user": None}
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
-    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]),
+                               signup_state(req.conn, row))}
 
 
 @route("PATCH", r"/api/me")
@@ -671,7 +777,8 @@ def api_update_me(req):
         with req.conn:
             req.conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", values)
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
-    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]),
+                               signup_state(req.conn, row))}
 
 
 # ---------------------------------------------------------------- guild API
@@ -1060,7 +1167,8 @@ def api_set_avatar(req):
         )
     discard_upload(previous)
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
-    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]),
+                               signup_state(req.conn, row))}
 
 
 @route("DELETE", r"/api/me/avatar")
@@ -1074,7 +1182,8 @@ def api_clear_avatar(req):
         req.conn.execute("UPDATE users SET avatar = NULL WHERE id = ?", (req.user["id"],))
     discard_upload(previous)
     row = req.conn.execute("SELECT * FROM users WHERE id = ?", (req.user["id"],)).fetchone()
-    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]))}
+    return {"user": me_payload(row, db.perks_for(req.conn, row["id"]),
+                               signup_state(req.conn, row))}
 
 
 # ------------------------------------------------------------- stickers API
@@ -1613,6 +1722,104 @@ def api_mark_read(req, channel_id):
     ).fetchone()["v"]
     mark_read(req.conn, req.user["id"], channel_id, top)
     return {"ok": True}
+
+
+# --------------------------------------------------------------- approvals
+
+def serialize_signup(conn, row, viewer_id):
+    who = conn.execute("SELECT * FROM users WHERE id = ?", (row["user_id"],)).fetchone()
+    decided = None
+    if row["decided_by"]:
+        decided = conn.execute(
+            "SELECT username FROM users WHERE id = ?", (row["decided_by"],)
+        ).fetchone()
+    viewer = conn.execute(
+        "SELECT is_admin FROM users WHERE id = ?", (viewer_id,)
+    ).fetchone()
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "createdAt": row["created_at"],
+        "decidedAt": row["decided_at"],
+        "decidedBy": decided["username"] if decided else None,
+        "canDecide": bool(viewer and viewer["is_admin"]) and row["status"] == "pending",
+        "user": {
+            "id": who["id"],
+            "username": who["username"],
+            "discriminator": who["discriminator"],
+            "tag": f'{who["username"]}#{who["discriminator"]}',
+            # The name they gave for verification. This card is the only place
+            # it is ever shown, and only an admin can see this card.
+            "fullName": who["full_name"],
+            "email": who["email"],
+            "color": who["color"],
+            "avatarUrl": db.avatar_url(who),
+            "createdAt": who["created_at"],
+        } if who else None,
+    }
+
+
+def admin_only(req):
+    row = req.conn.execute(
+        "SELECT is_admin FROM users WHERE id = ?", (req.user["id"],)
+    ).fetchone()
+    if not row or not row["is_admin"]:
+        raise HttpError(403, "Only an administrator can do that.")
+
+
+@route("GET", r"/api/signups")
+def api_signups(req):
+    """Everyone still waiting. The admin's list, for catching up."""
+    req.require_auth()
+    admin_only(req)
+    rows = req.conn.execute(
+        "SELECT * FROM signups WHERE status = 'pending' ORDER BY id"
+    ).fetchall()
+    return {"signups": [serialize_signup(req.conn, r, req.user["id"]) for r in rows]}
+
+
+@route("POST", r"/api/signups/(\d+)/decide")
+def api_decide_signup(req, signup_id):
+    req.require_auth()
+    admin_only(req)
+    row = req.conn.execute(
+        "SELECT * FROM signups WHERE id = ?", (int(signup_id),)
+    ).fetchone()
+    if not row:
+        raise HttpError(404, "No such application.")
+    verdict = (req.body.get("verdict") or "").lower()
+    if verdict not in ("approve", "decline"):
+        raise HttpError(400, "Verdict must be 'approve' or 'decline'.")
+    if row["status"] != "pending":
+        raise HttpError(409, f"That was already {row['status']}.")
+
+    with req.conn:
+        req.conn.execute(
+            "UPDATE signups SET status = ?, decided_by = ?, decided_at = ?"
+            " WHERE id = ? AND status = 'pending'",
+            ("approved" if verdict == "approve" else "declined",
+             req.user["id"], db.now(), row["id"]),
+        )
+        req.conn.execute(
+            "UPDATE users SET approved = ? WHERE id = ?",
+            (1 if verdict == "approve" else 0, row["user_id"]),
+        )
+
+    # Redraw every card for this application, in case more than one admin has
+    # one sitting in their DMs.
+    msg = req.conn.execute(
+        "SELECT id FROM messages WHERE signup_id = ? AND channel_id IN ("
+        "  SELECT channel_id FROM dm_participants WHERE user_id = ?)",
+        (row["id"], req.user["id"]),
+    ).fetchone()
+    return {
+        "signup": serialize_signup(
+            req.conn,
+            req.conn.execute("SELECT * FROM signups WHERE id = ?", (row["id"],)).fetchone(),
+            req.user["id"],
+        ),
+        "message": serialize_one(req.conn, msg["id"], req.user["id"]) if msg else None,
+    }
 
 
 # ------------------------------------------------------------------- polls
@@ -3661,6 +3868,14 @@ def draw_loop(stop):
 
 # --------------------------------------------------------------- HTTP layer
 
+# The only endpoints an unapproved account may reach: enough to be told what
+# it is waiting for, to sign out, and to sign in as somebody else — a stale
+# cookie from an account that was turned away must not lock the browser out
+# of the login form.
+PENDING_ALLOWED = {"/api/me", "/api/logout", "/api/health",
+                   "/api/login", "/api/register"}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Nexus"
     protocol_version = "HTTP/1.1"
@@ -3870,6 +4085,18 @@ class Handler(BaseHTTPRequestHandler):
             req = Req(conn, body, parse_qs(parsed.query), cookies, user, self, raw)
             if refresh_cookie:
                 req.set_cookie = token
+
+            # Somebody waiting on approval is signed in but not let in. They
+            # can ask who they are and they can sign out; everything else is
+            # closed until an admin says otherwise.
+            if user and not user.get("approved", 1) and path not in PENDING_ALLOWED:
+                self._send_json(
+                    403,
+                    {"error": "Your account is waiting to be approved.",
+                     "pending": True},
+                    req,
+                )
+                return
 
             if handler_fn:
                 self._send_json(200, handler_fn(req, *groups), req)

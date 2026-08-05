@@ -210,6 +210,19 @@ CREATE TABLE IF NOT EXISTS purchases (
     UNIQUE (user_id, item)
 );
 
+-- One row per account that has asked to join. Kept after the decision so a
+-- declined address can't simply sign up again, and so there is a record of
+-- who let each person in.
+CREATE TABLE IF NOT EXISTS signups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status     TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | declined
+    decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    decided_at INTEGER,
+    created_at INTEGER NOT NULL,
+    UNIQUE (user_id)
+);
+
 -- Lottery tickets. One row per ticket, so buying ten is ten chances.
 -- `draw_at` is the moment of the draw the ticket is entered into, so a ticket
 -- bought after today's draw goes into tomorrow's.
@@ -318,6 +331,7 @@ def init():
         conn.executescript(SCHEMA)
         migrate(conn)
         ensure_bot(conn)
+        ensure_admin(conn)
         # Drop sessions nobody has touched in a month.
         conn.execute(
             "DELETE FROM sessions WHERE last_used > 0 AND last_used < ?",
@@ -911,6 +925,83 @@ def ensure_bot_avatar(conn, uid):
     conn.execute("UPDATE users SET avatar = ? WHERE id = ?", (BOT_AVATAR_NAME, uid))
 
 
+# ------------------------------------------------------------- the admin
+
+# Who approves new sign-ups. NEXUS_ADMIN_EMAIL wins if it is set; the default
+# below is the site owner's own address, so approvals work on a fresh deploy
+# with nothing configured. Setting the environment variable in your host's
+# dashboard instead keeps the address out of the repository.
+DEFAULT_ADMIN_EMAIL = "chazza9944@gmail.com"
+ADMIN_EMAIL = (
+    os.environ.get("NEXUS_ADMIN_EMAIL") or DEFAULT_ADMIN_EMAIL
+).strip().lower()
+
+# Set NEXUS_OPEN_SIGNUP=1 to let anyone in without waiting. Off by default,
+# so a fresh deploy holds new accounts. With it on there is nobody checking
+# who anyone is, so the real name isn't asked for either.
+OPEN_SIGNUP = (os.environ.get("NEXUS_OPEN_SIGNUP") or "").lower() in (
+    "1", "true", "yes", "on"
+)
+
+
+def admin_ids(conn):
+    return [r["id"] for r in conn.execute(
+        "SELECT id FROM users WHERE is_admin = 1 AND is_bot = 0 ORDER BY id"
+    )]
+
+
+def ensure_admin(conn):
+    """Make sure somebody can approve people.
+
+    Runs on every boot: naming an account in NEXUS_ADMIN_EMAIL hands the job
+    over, and otherwise an existing admin is left alone. A site with no
+    accounts at all has nobody to promote yet — the first person to sign up
+    becomes the admin instead.
+    """
+    if ADMIN_EMAIL:
+        row = conn.execute(
+            "SELECT id FROM users WHERE email = ? AND is_bot = 0", (ADMIN_EMAIL,)
+        ).fetchone()
+        if row:
+            conn.execute("UPDATE users SET is_admin = 0 WHERE is_admin = 1")
+            conn.execute(
+                "UPDATE users SET is_admin = 1, approved = 1 WHERE id = ?", (row["id"],)
+            )
+            return row["id"]
+
+    existing = admin_ids(conn)
+    if existing:
+        return existing[0]
+
+    oldest = conn.execute(
+        "SELECT id FROM users WHERE is_bot = 0 ORDER BY id LIMIT 1"
+    ).fetchone()
+    if not oldest:
+        return None
+    conn.execute(
+        "UPDATE users SET is_admin = 1, approved = 1 WHERE id = ?", (oldest["id"],)
+    )
+    return oldest["id"]
+
+
+# ------------------------------------------------------------- sign-ups
+
+def create_signup(conn, user_id):
+    conn.execute(
+        "INSERT OR IGNORE INTO signups (user_id, status, created_at) VALUES (?,?,?)",
+        (user_id, "pending", now()),
+    )
+    return conn.execute(
+        "SELECT id FROM signups WHERE user_id = ?", (user_id,)
+    ).fetchone()["id"]
+
+
+def signup_for(conn, user_id):
+    return conn.execute(
+        "SELECT * FROM signups WHERE user_id = ?", (user_id,)
+    ).fetchone()
+
+
 def bot_id(conn):
     row = conn.execute("SELECT id FROM users WHERE email = ?", (BOT_EMAIL,)).fetchone()
     return row["id"] if row else None
@@ -948,6 +1039,17 @@ def migrate(conn):
     if "work_shifts" not in have:
         # Hours on the clock, which is what earns the 20% rises.
         conn.execute("ALTER TABLE users ADD COLUMN work_shifts INTEGER NOT NULL DEFAULT 0")
+    if "approved" not in have:
+        # Defaults to 1, which approves every account that already exists —
+        # and the bot — in one stroke. Only new sign-ups are written with 0,
+        # so nobody who is already using the site is locked out by this.
+        conn.execute("ALTER TABLE users ADD COLUMN approved INTEGER NOT NULL DEFAULT 1")
+        conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+    if "full_name" not in have:
+        # The name they go by off the site, asked for at sign-up so an admin
+        # can tell who is applying. Shown only on the approval card and in
+        # their own settings — never in the member list or on a message.
+        conn.execute("ALTER TABLE users ADD COLUMN full_name TEXT NOT NULL DEFAULT ''")
     if "sawers_until" not in have:
         # When the hire runs out, and the last hour of his that was paid for.
         conn.execute("ALTER TABLE users ADD COLUMN sawers_until INTEGER NOT NULL DEFAULT 0")
@@ -984,6 +1086,12 @@ def migrate(conn):
             " REFERENCES games(id) ON DELETE CASCADE"
         )
 
+    if "signup_id" not in have:
+        # An approval card. Like a poll, the card is the whole message.
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN signup_id INTEGER"
+            " REFERENCES signups(id) ON DELETE CASCADE"
+        )
     if "poll_id" not in have:
         # A poll message carries no text of its own; the card is the message.
         conn.execute(
@@ -1045,18 +1153,37 @@ def pick_discriminator(conn, username):
             return tag
 
 
-def create_user(conn, username, email, password):
+def clean_name(raw):
+    """Tidy a real name without policing it — names vary more than any
+    pattern you would write for them."""
+    return " ".join(str(raw or "").split())[:80]
+
+
+def create_user(conn, username, email, password, full_name=""):
+    """Create an account, held for approval unless it is the very first one.
+
+    Somebody has to be able to let people in, so on an empty site the first
+    person through the door is the admin and is approved on the spot.
+    """
     pw_hash, salt = hash_password(password)
     tag = pick_discriminator(conn, username)
     if tag is None:
         raise ValueError("That username is full — pick another.")
     color = secrets.choice(COLORS)
+    first = not conn.execute(
+        "SELECT 1 FROM users WHERE is_bot = 0 LIMIT 1"
+    ).fetchone()
+    # `first` also decides who gets the admin flag, so an open site still has
+    # exactly one admin — it just doesn't make anyone wait.
+    approved = first or OPEN_SIGNUP
     cur = conn.execute(
         "INSERT INTO users (username, discriminator, email, password_hash, salt,"
-        " color, created_at, last_seen) VALUES (?,?,?,?,?,?,?,?)",
-        (username, tag, email.lower(), pw_hash, salt, color, now(), now()),
+        " color, created_at, last_seen, approved, is_admin, full_name)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (username, tag, email.lower(), pw_hash, salt, color, now(), now(),
+         1 if approved else 0, 1 if first else 0, clean_name(full_name)),
     )
-    return cur.lastrowid
+    return cur.lastrowid, approved
 
 
 def avatar_url(row):

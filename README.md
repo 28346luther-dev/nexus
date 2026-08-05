@@ -131,6 +131,8 @@ platform's health check at it.
 | `NEXUS_DB`      | `./data.db`          | Database location. Point at your volume in prod.  |
 | `NEXUS_UPLOADS` | next to `NEXUS_DB`   | Where uploaded images are written.                |
 | `GIPHY_API_KEY` | unset                | Enables `/gif`. Without it the picker says so.    |
+| `NEXUS_ADMIN_EMAIL` | see `db.py`      | Account that approves new sign-ups.               |
+| `NEXUS_OPEN_SIGNUP` | unset            | `1` lets anyone in without approval.              |
 | `NEXUS_DRAW_HOUR` | `18`               | Hour of the daily lottery draw.                   |
 | `NEXUS_DRAW_TZ` | `Australia/Sydney`   | Zone that hour is read in, whatever the host uses.|
 
@@ -169,6 +171,35 @@ there is no second variable to set.
 **Accounts** — email + password sign-up. Passwords are stored as PBKDF2-SHA256
 with 200,000 iterations and a per-user salt. Sessions are HttpOnly cookies with
 a sliding 30-day expiry.
+
+**Sign-ups are approved by an administrator.** New accounts ask for the name
+you go by as well as a username, and then wait:
+
+> Thanks for joining our learning resource manager. We will approve you shortly.
+
+Until somebody lets them in, the account can do exactly two things — find out
+who it is, and sign out. Every other endpoint answers 403, so the hold is
+enforced by the server rather than by hiding buttons. The page checks back
+every few seconds and drops them into the app the moment they're approved,
+without a refresh.
+
+The **Frontman DMs the administrator** a card for each application, showing the
+name given for verification, the tag and the email, with **Approve** and
+**Decline** on it. It arrives with an unread badge like any other DM, and
+nobody but the admin can see it — the real name is shown nowhere else in the
+app. `/api/signups` lists everyone still waiting, for catching up after a
+break. Declining keeps the record, so a refused address can't just sign up
+again.
+
+**Everyone who already had an account is approved automatically** — the column
+defaults to "in", so deploying this locks out nobody who was already using the
+site.
+
+Who the admin is: `NEXUS_ADMIN_EMAIL` if you set it, otherwise the address
+baked into `db.py`, and failing both the oldest account on the site. That
+account is also let in on sight if it signs up fresh, so a brand-new deploy
+can never end up with a queue nobody can clear. Set `NEXUS_OPEN_SIGNUP=1` to
+turn the whole thing off and let anyone in.
 
 **Servers and channels** — anyone can create a server; it starts with `#general`
 and `#random`. The owner can add and delete channels, **drag channels in the
