@@ -205,39 +205,106 @@ def add_cpu(state):
     return player
 
 
-def cpu_decision(state, player):
-    """Rough but not daft: play made hands, chase less as the board fills.
+# ------------------------------------------------------------------ equity
 
-    Returns one of "check", "call", "raise" or "fold". The house only raises
-    with something worth raising, so a raise is real information.
+ALL_CARDS = tuple(f"{rank}{suit}" for suit in SUITS for rank in RANKS)
+
+
+def trials_for(board, opponents):
+    """How many deals to run.
+
+    Each trial ranks every live hand, so the cost climbs with the table. The
+    river needs no runout and is cheap; the flop deals two more cards and is
+    the expensive one. These numbers keep a decision under about a tenth of a
+    second, which is the budget: a table of house players must not make the
+    person who clicked wait.
+    """
+    budget = 900 if len(board) >= 5 else 500
+    return max(80, budget // max(1, opponents))
+
+
+def equity(hole, board, opponents, trials=None):
+    """Roughly how often this hand wins, by dealing the rest out at random.
+
+    A tie counts as half, since the pot is split. This is what turns a bot
+    that only knows "do I have a pair" into one that knows a pair of fours on
+    a four-flush board against three players is worth very little.
+    """
+    if opponents <= 0:
+        return 1.0
+    if trials is None:
+        trials = trials_for(board, opponents)
+
+    known = set(hole) | set(board)
+    deck = [c for c in ALL_CARDS if c not in known]
+    needed = 5 - len(board)
+    draw_size = needed + 2 * opponents
+    if draw_size > len(deck):
+        return 0.5
+
+    rng = secrets.SystemRandom()
+    score = 0.0
+    for _ in range(trials):
+        drawn = rng.sample(deck, draw_size)
+        full_board = board + drawn[:needed]
+        mine = best_hand(hole + full_board)["score"]
+        best_other = None
+        at = needed
+        for _ in range(opponents):
+            theirs = best_hand(list(drawn[at:at + 2]) + full_board)["score"]
+            at += 2
+            if best_other is None or theirs > best_other:
+                best_other = theirs
+        if mine > best_other:
+            score += 1.0
+        elif mine == best_other:
+            score += 0.5
+    return score / trials
+
+
+def cpu_decision(state, player):
+    """Decide by working out how often the hand actually wins, and what the
+    pot is offering to find out.
+
+    Returns one of "check", "call", "raise" or "fold". Calling is worth it
+    when the chance of winning beats the price: paying 200 into an 800 pot
+    needs 200/1000, or 20%, to break even. Anything better than that is a
+    call whatever the cards look like, and anything worse is a fold however
+    pretty they are — which is the whole difference between this and guessing
+    from the hand category.
     """
     rng = secrets.SystemRandom()
-    category = best_hand(player["hole"] + state["board"])["score"][0]
+    rivals = [p for p in active(state) if p is not player]
+    if not rivals:
+        return "check"
+
+    chance = equity(player["hole"], state["board"], len(rivals))
     price = owed(state, player)
 
-    if category >= 3:                    # trips or better — put money in
-        if price == 0 and rng.random() < 0.6:
-            return "raise"
-        if state.get("toMatch", 0) <= state["ante"] * 4 and rng.random() < 0.35:
-            return "raise"
-        return "call" if price else "check"
-
-    if category == 2:                    # two pair: happy to pay, slow to raise
-        return "call" if price else "check"
-
     if price == 0:
-        # Free card. Take it, and occasionally bluff at a scary board.
-        return "raise" if category == 1 and rng.random() < 0.12 else "check"
+        # A free card. Bet when ahead, and now and then when hopeless, so a
+        # bet from the house isn't a guarantee of a hand.
+        if chance > 0.72:
+            return "raise" if rng.random() < 0.7 else "check"
+        if chance > 0.55:
+            return "raise" if rng.random() < 0.3 else "check"
+        if chance < 0.25 and rng.random() < 0.10:
+            return "raise"
+        return "check"
 
-    # Paying to continue with not much. Pot odds, roughly: the bigger the ask
-    # relative to the ante, the less often it is worth it.
-    steep = price > state["ante"] * 3
-    if category == 1:
-        return "call" if rng.random() < (0.45 if steep else 0.85) else "fold"
-    chase = {"flop": 0.5, "turn": 0.3, "river": 0.12}.get(state["stage"], 0.25)
-    if steep:
-        chase /= 2
-    return "call" if rng.random() < chase else "fold"
+    # The share of the final pot being bought, which is what the chance of
+    # winning has to beat.
+    breakeven = price / (state["pot"] + price)
+
+    if chance > breakeven + 0.25:
+        return "raise" if rng.random() < 0.55 else "call"
+    if chance > breakeven + 0.02:
+        return "call"
+    # A shade short: pay it occasionally rather than folding like clockwork,
+    # or the house becomes trivially readable.
+    if chance > breakeven - 0.05 and rng.random() < 0.2:
+        return "call"
+    return "fold"
 
 
 def play_cpus(state):

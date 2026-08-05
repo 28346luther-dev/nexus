@@ -217,6 +217,56 @@ check("the pot survives the street", table["pot"] == 400, table["pot"])
 check("folding leaves one player standing",
       (poker.fold(table, 2), poker.hand_over(table))[1])
 
+# --------------------------------------------------------- the house's brain
+# Equity is sampled, so these compare hands that are far enough apart that
+# noise can't flip them.
+nut = poker.equity(["A♠", "K♠"], ["Q♠", "7♠", "2♠"], 3)
+junk = poker.equity(["3♥", "8♦"], ["A♠", "K♣", "Q♦"], 3)
+check("a made flush is worth a lot", nut > 0.85, nut)
+check("air is worth very little", junk < 0.20, junk)
+check("a set beats top pair on the same board",
+      poker.equity(["Q♥", "Q♦"], ["Q♠", "7♣", "2♦"], 3)
+      > poker.equity(["A♥", "K♦"], ["A♠", "7♣", "2♦"], 3))
+check("the same hand is worth less against more people",
+      poker.equity(["A♥", "K♦"], ["A♠", "7♣", "2♦"], 5)
+      < poker.equity(["A♥", "K♦"], ["A♠", "7♣", "2♦"], 1))
+check("a certainty is a certainty",
+      poker.equity(["A♠", "K♠"], ["Q♠", "J♠", "10♠"], 3) > 0.95)
+check("nobody to beat means nothing to work out",
+      poker.equity(["2♥", "7♦"], ["A♠", "K♣", "Q♦"], 0) == 1.0)
+
+
+def house_calls(price, pot, hole, board, rivals=2, tries=30):
+    """How often the house pays `price` with this hand, out of `tries`."""
+    table = {
+        "pot": pot, "toMatch": price, "board": board, "ante": 100, "stage": "flop",
+        "players": [{"userId": 1, "hole": hole, "folded": False, "street": 0,
+                     "acted": False}]
+        + [{"userId": i + 2, "hole": [], "folded": False, "street": 0, "acted": False}
+           for i in range(rivals)],
+    }
+    me = table["players"][0]
+    return sum(1 for _ in range(tries)
+               if poker.cpu_decision(table, me) in ("call", "raise")) / tries
+
+
+weak, board = ["4♥", "5♦"], ["A♠", "K♣", "9♦"]
+cheap = house_calls(50, 2000, weak, board)
+dear = house_calls(2000, 200, weak, board)
+check("the house takes a cheap price with a weak hand", cheap > 0.8, cheap)
+check("and folds the same hand at a dear one", dear < 0.2, dear)
+check("but pays any price with a monster",
+      house_calls(2000, 200, ["A♥", "A♦"], ["A♠", "K♣", "9♦"]) > 0.8)
+check("a free card is always taken",
+      poker.cpu_decision(
+          {"pot": 500, "toMatch": 0, "board": board, "ante": 100, "stage": "flop",
+           "players": [{"userId": 1, "hole": weak, "folded": False, "street": 0,
+                        "acted": False},
+                       {"userId": 2, "hole": [], "folded": False, "street": 0,
+                        "acted": False}]},
+          {"userId": 1, "hole": weak, "folded": False, "street": 0, "acted": False},
+      ) in ("check", "raise"))
+
 # ------------------------------------------------------ all in and side pots
 short = poker.new_table(1, 100)
 short["players"].append(poker.new_player(2))

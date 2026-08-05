@@ -302,6 +302,16 @@ turn of anyone who had already acted; **Call** matches what's owed and **Fold**
 gets out. Raises go in whole antes, up to twenty at a time. Best five cards of
 your seven wins, and ties split the pot.
 
+**The house players work out the odds.** Each decision runs a few hundred
+random deals of the remaining cards, counts how often the hand actually wins,
+and compares that against the price it is being offered — 200 to call into an
+800 pot needs 20% to break even. Anything better is a call whatever the cards
+look like, anything worse is a fold however pretty they are. So they fold to a
+big bet with a weak hand, pay a cheap one with the same hand, chase real draws
+and give up on dead ones, and they know a pair is worth much less against five
+players than against one. They bluff occasionally, so a bet is not proof of a
+hand. A decision takes about a tenth of a second and needs nothing installed.
+
 **Being short doesn't put you out.** Call more than you can cover and you go
 **all in** for whatever is left, and that is the end of what anyone can ask of
 you — a raise behind you never reopens a decision you have no chips to make.

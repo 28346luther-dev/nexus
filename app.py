@@ -4328,6 +4328,55 @@ class Server(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
+def report_servers(conn):
+    """Every server on the site, for someone with shell access and no wish to
+    join them all just to look."""
+    rows = conn.execute(
+        "SELECT g.id, g.name, g.created_at, u.username owner, u.discriminator tag,"
+        "  (SELECT COUNT(*) FROM guild_members m WHERE m.guild_id = g.id) members,"
+        "  (SELECT COUNT(*) FROM channels c WHERE c.guild_id = g.id"
+        "     AND c.kind = 'text') channels,"
+        "  (SELECT COUNT(*) FROM messages ms JOIN channels c2 ON c2.id = ms.channel_id"
+        "     WHERE c2.guild_id = g.id) messages"
+        " FROM guilds g LEFT JOIN users u ON u.id = g.owner_id ORDER BY g.id"
+    ).fetchall()
+
+    print(f"\n{len(rows)} server{'' if len(rows) == 1 else 's'} on this site\n")
+    if not rows:
+        return
+    print(f"{'id':>4}  {'name':<26} {'owner':<20} {'people':>6} {'chans':>6} "
+          f"{'msgs':>7}  created")
+    print("  " + "-" * 92)
+    for r in rows:
+        # The bot is in every server and is nobody's friend; don't count it as
+        # a member, or an empty server looks like it has one.
+        owner = f"{r['owner']}#{r['tag']}" if r["owner"] else "(deleted)"
+        when = time.strftime("%Y-%m-%d", time.localtime(r["created_at"]))
+        print(f"{r['id']:>4}  {r['name'][:26]:<26} {owner[:20]:<20} "
+              f"{max(0, r['members'] - 1):>6} {r['channels']:>6} {r['messages']:>7}  {when}")
+    print()
+
+
+def report_people(conn):
+    """Every account, with anyone still waiting on approval called out."""
+    rows = conn.execute(
+        "SELECT id, username, discriminator, email, full_name, approved, is_admin,"
+        " coins, created_at FROM users WHERE is_bot = 0 ORDER BY id"
+    ).fetchall()
+    waiting = [r for r in rows if not r["approved"]]
+
+    print(f"\n{len(rows)} account{'' if len(rows) == 1 else 's'}"
+          f"{f' — {len(waiting)} waiting for approval' if waiting else ''}\n")
+    print(f"{'id':>4}  {'tag':<22} {'name':<22} {'email':<28} {'coins':>10}  status")
+    print("  " + "-" * 100)
+    for r in rows:
+        tag = f"{r['username']}#{r['discriminator']}"
+        status = "admin" if r["is_admin"] else ("in" if r["approved"] else "WAITING")
+        print(f"{r['id']:>4}  {tag[:22]:<22} {(r['full_name'] or '-')[:22]:<22} "
+              f"{r['email'][:28]:<28} {r['coins']:>10,}  {status}")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run the Nexus messaging server.")
     # Hosts like Railway, Render and Fly assign the port through $PORT.
@@ -4337,7 +4386,27 @@ def main():
                              " on your network (or your host platform) can reach it;"
                              " pass 127.0.0.1 to keep it to this machine only.")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--servers", action="store_true",
+        help="List every server in the database and exit, without starting up.",
+    )
+    parser.add_argument(
+        "--people", action="store_true",
+        help="List every account, who is waiting for approval, and exit.",
+    )
     args = parser.parse_args()
+
+    # These read the database and quit — no port is opened, so they are safe
+    # to run against a live site while it is serving.
+    if args.servers or args.people:
+        db.init()
+        conn = db.connect()
+        if args.servers:
+            report_servers(conn)
+        if args.people:
+            report_people(conn)
+        conn.close()
+        return
     if args.verbose:
         os.environ["NEXUS_FLAGS"] = "--verbose"
 
