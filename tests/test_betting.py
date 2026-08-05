@@ -233,6 +233,102 @@ check("a straight number pays 35 to 1", spin["pays"] == 35, spin)
 check("a straight number only wins on itself",
       (spin["profit"] > 0) == (spin["number"] == 17), spin)
 
+# ==================================================== all in, not forced out
+import sqlite3                                                    # noqa: E402
+DB_PATH = sys.argv[2] if len(sys.argv) > 2 else "/tmp/nexus_test.db"
+
+
+def set_coins(client, amount):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE users SET coins = ? WHERE id = ?", (amount, client.uid))
+    conn.commit()
+    conn.close()
+
+
+set_coins(host, 100_000)
+set_coins(p2, 100_000)
+_, r = host.call("POST", f"/api/channels/{cid}/poker", {"bet": 100})
+allin = r["message"]["game"]["id"]
+p2.call("POST", f"/api/games/{allin}/poker/join")
+host.call("POST", f"/api/games/{allin}/poker/deal")
+
+# Leave the host with less than the bet they are about to face.
+set_coins(host, 50)
+p2.call("POST", f"/api/games/{allin}/poker/action", {"action": "raise", "raise": 1000})
+s, r = host.call("POST", f"/api/games/{allin}/poker/action", {"action": "call"})
+check("a short stack is not refused", s == 200, (s, r))
+t = r["message"]["game"]
+mine = [x for x in t["seats"] if x["isYou"]][0]
+check("it puts in what it has", mine["allIn"] is True, mine)
+check("and stays in the hand", mine["folded"] is False, mine)
+check("the wallet is emptied, not overdrawn", r["wallet"]["coins"] == 0,
+      r["wallet"]["coins"])
+
+# The hand plays on, and another raise must not demand more from them.
+_, before = host.call("GET", "/api/wallet")
+for _ in range(6):
+    t = board(host, allin)
+    if t["status"] != "playing":
+        break
+    if t["yourTurn"]:
+        s, r = host.call("POST", f"/api/games/{allin}/poker/action", {"action": "check"})
+        check("an all-in player is never asked to act again", False, (s, r))
+        break
+    p2.call("POST", f"/api/games/{allin}/poker/action", {"action": "raise", "raise": 500})
+_, after = host.call("GET", "/api/wallet")
+check("nothing more is taken from an empty wallet",
+      after["coins"] == before["coins"], (before["coins"], after["coins"]))
+
+done = board(host, allin)
+check("the hand reaches an end", done["status"] == "finished", done["status"])
+mine = [x for x in done["seats"] if x["isYou"]][0]
+check("the short stack was never forced to fold", mine["folded"] is False, mine)
+if mine["won"]:
+    check("a short stack wins only what it matched",
+          mine["wonAmount"] <= done["pot"], (mine["wonAmount"], done["pot"]))
+
+# ================================================================= begging
+set_coins(host, 50_000)
+set_coins(p2, 50_000)
+_, before = host.call("GET", "/api/wallet")
+s, r = host.call("POST", f"/api/channels/{cid}/beg")
+check("begging works", s == 200, r)
+beg = r["message"]["game"]
+check("the card says who is asking", beg["player"]["id"] == host.uid, beg)
+check("the Frontman either gives or doesn't",
+      beg["botGave"] == 0 or 100 <= beg["botGave"] <= 1000, beg)
+check("and the wallet matches whatever it did",
+      r["wallet"]["coins"] == before["coins"] + beg["botGave"],
+      (before["coins"], r["wallet"]["coins"], beg["botGave"]))
+check("the beggar gets no Give button", beg["canGive"] is False, beg)
+
+s, r = host.call("POST", f"/api/channels/{cid}/beg")
+check("you can't beg twice in half an hour", s == 429, (s, r))
+
+# Other players can give whatever they like.
+theirs = board(p2, beg["id"])
+check("everyone else can give", theirs["canGive"] is True, theirs)
+s, r = p2.call("POST", f"/api/games/{beg['id']}/beg/give", {"amount": 2500})
+check("a donation lands", s == 200, r)
+check("it comes out of the giver's pocket",
+      r["wallet"]["coins"] == 50_000 - 2500, r["wallet"]["coins"])
+card = r["message"]["game"]
+check("and is listed on the card",
+      len(card["donations"]) == 1 and card["donations"][0]["amount"] == 2500,
+      card["donations"])
+_, w = host.call("GET", "/api/wallet")
+check("the beggar is better off",
+      w["coins"] == before["coins"] + beg["botGave"] + 2500, w["coins"])
+
+s, r = host.call("POST", f"/api/games/{beg['id']}/beg/give", {"amount": 100})
+check("you can't beg from yourself", s == 400, (s, r))
+s, r = p2.call("POST", f"/api/games/{beg['id']}/beg/give", {"amount": 0})
+check("nothing is not a donation", s == 400, (s, r))
+s, r = p2.call("POST", f"/api/games/{beg['id']}/beg/give", {"amount": -500})
+check("nor is a negative one", s == 400, (s, r))
+s, r = p2.call("POST", f"/api/games/{beg['id']}/beg/give", {"amount": 99_000_000})
+check("you can't give what you haven't got", s == 400, (s, r))
+
 # ======================================================= one card, replayed
 def cards_in_channel(client):
     _, r = client.call("GET", f"/api/channels/{cid}/messages")

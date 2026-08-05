@@ -945,6 +945,7 @@ function pokerNode(g) {
     if (s.user) who.appendChild(avatar({ ...s.user, online: undefined }, 'xs'));
     who.appendChild(nameNode(s.user, 'poker-name'));
     if (s.folded) who.appendChild(el('span', 'seat-flag', 'FOLD'));
+    else if (s.allIn) who.appendChild(el('span', 'seat-flag all-in-flag', 'ALL IN'));
     else if (s.acted && g.stage !== 'showdown') who.appendChild(el('span', 'seat-flag', 'IN'));
     if (s.won) who.appendChild(el('span', 'seat-flag win-flag', 'WON'));
     row.appendChild(who);
@@ -964,12 +965,16 @@ function pokerNode(g) {
   card.appendChild(seats);
 
   if (g.result) {
-    const iWon = g.seats.some((s) => s.isYou && s.won);
+    const mine = g.seats.find((s) => s.isYou);
+    const iWon = !!(mine && mine.won);
     const banner = el('div', `game-result ${iWon ? 'win' : (g.youArePlaying ? 'lose' : '')}`.trim());
-    const names = g.seats.filter((s) => s.won).map((s) => (s.user ? s.user.username : '?'));
+    // Side pots mean the winners can take different amounts, so each is named
+    // with what they actually got rather than one figure for everybody.
+    const took = g.seats.filter((s) => s.won).map((s) =>
+      `${s.user ? s.user.username : '?'} ${(s.wonAmount || 0).toLocaleString()} ${COIN}`);
     banner.appendChild(el('strong', null, iWon
-      ? `You won ${g.result.share.toLocaleString()} ${COIN}`
-      : `${names.join(' & ')} won ${g.result.share.toLocaleString()} ${COIN}`));
+      ? `You won ${(mine.wonAmount || 0).toLocaleString()} ${COIN}`
+      : `${took.join(' · ')}`));
     banner.appendChild(el('span', null, g.result.text));
     card.appendChild(banner);
   }
@@ -988,13 +993,17 @@ function pokerNode(g) {
   if (g.yourTurn) {
     // Checking is free, so it is the safe default when nothing is owed; when
     // there is, the same slot becomes Call and says what it costs.
+    // Short of the call, the same button puts the rest in and goes all in.
+    const short = g.toCall > g.balance;
     const stay = el('button', 'btn primary small',
-      g.toCall ? `Call ${coins(g.toCall)}` : 'Check');
+      g.toCall ? (short ? `All in for ${coins(g.balance)}` : `Call ${coins(g.toCall)}`)
+               : 'Check');
     stay.onclick = () => pokerCall(g.id, 'action',
       { action: g.toCall ? 'call' : 'check' });
 
     const raise = el('button', 'btn small', 'Raise');
     raise.onclick = () => askRaise(g);
+    if (g.balance <= g.toCall) raise.disabled = true;
 
     const fold = el('button', 'btn small', 'Fold');
     fold.onclick = () => pokerCall(g.id, 'action', { action: 'fold' });
@@ -1146,6 +1155,108 @@ function rouletteNode(g) {
   return card;
 }
 
+function begNode(g) {
+  const card = el('div', `game-card beg ${g.raised ? 'won' : ''}`.trim());
+
+  const head = el('div', 'game-head');
+  head.appendChild(el('span', 'game-title', 'Spare any change?'));
+  head.appendChild(balanceChip(g));
+  head.appendChild(el('span', 'game-status',
+    g.raised ? `raised ${g.raised.toLocaleString()} ${COIN}` : 'nothing yet'));
+  card.appendChild(head);
+
+  const top = el('div', 'wallet-top');
+  if (g.player) top.appendChild(avatar({ ...g.player, online: undefined }, 'lg'));
+  const meta = el('div');
+  meta.appendChild(nameNode(g.player, 'wallet-name'));
+  meta.appendChild(el('div', 'muted', 'is asking for donations.'));
+  top.appendChild(meta);
+  card.appendChild(top);
+
+  const banner = el('div', `game-result ${g.botGave ? 'win' : 'lose'}`);
+  banner.appendChild(el('strong', null, g.botGave
+    ? `+${g.botGave.toLocaleString()} ${COIN} from the Frontman`
+    : 'The Frontman gives nothing'));
+  banner.appendChild(el('span', null, `It ${g.line}.`));
+  card.appendChild(banner);
+
+  if (g.donations.length) {
+    const list = el('div', 'beg-list');
+    g.donations.forEach((d) => {
+      const row = el('div', 'beg-row');
+      if (d.user) row.appendChild(avatar({ ...d.user, online: undefined }, 'xs'));
+      row.appendChild(el('span', 'beg-who', d.user ? d.user.username : 'Someone'));
+      row.appendChild(el('span', 'beg-amount', `${d.amount.toLocaleString()} ${COIN}`));
+      list.appendChild(row);
+    });
+    card.appendChild(list);
+  }
+
+  if (g.canGive) {
+    const actions = el('div', 'game-actions');
+    const give = el('button', 'btn primary small', 'Give something');
+    give.onclick = () => askDonation(g);
+    actions.appendChild(give);
+    card.appendChild(actions);
+  }
+
+  card.appendChild(el('div', 'game-foot',
+    `${g.player ? g.player.username : 'Someone'} passed the hat round`));
+  return card;
+}
+
+/** How much to drop in the hat. Entirely up to whoever is giving. */
+function askDonation(g) {
+  const have = state.wallet ? state.wallet.coins : g.balance || 0;
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Give something'));
+    box.appendChild(el('p', 'sub',
+      `Straight out of your own pocket to ${g.player ? g.player.username : 'them'}. `
+      + `You have ${coins(have)}.`));
+
+    const form = el('form');
+    const label = el('label', 'field');
+    label.appendChild(el('span', null, 'Amount'));
+    const field = el('input');
+    field.type = 'number';
+    field.min = '1';
+    field.value = String(Math.min(500, have));
+    label.appendChild(field);
+    form.appendChild(label);
+
+    const quick = el('div', 'stake-quick');
+    [100, 500, 1000, 5000].filter((n) => n <= have).forEach((n) => {
+      const b = el('button', 'btn small ghost', n.toLocaleString());
+      b.type = 'button';
+      b.onclick = () => { field.value = String(n); };
+      quick.appendChild(b);
+    });
+    form.appendChild(quick);
+
+    const actions = el('div', 'modal-actions');
+    const cancel = el('button', 'btn ghost', 'Cancel');
+    cancel.type = 'button';
+    cancel.onclick = close;
+    const go = el('button', 'btn primary', 'Give');
+    actions.append(cancel, go);
+    form.appendChild(actions);
+
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const n = parseInt(field.value, 10);
+      if (!n || n < 1) return toast('Enter an amount.', 'error');
+      go.disabled = true;
+      try {
+        const data = await api('POST', `/api/games/${g.id}/beg/give`, { amount: n });
+        if (data.wallet) state.wallet = data.wallet;
+        replaceMessage(data.message);
+        close();
+      } catch (err) { toast(err.message, 'error'); go.disabled = false; }
+    };
+    box.appendChild(form);
+  });
+}
+
 function statLine(label, value) {
   const row = el('div', 'stat');
   row.appendChild(el('span', 'stat-label', label));
@@ -1258,6 +1369,7 @@ function gameNode(m) {
   if (g.mode === 'poker') return pokerNode(g);
   if (g.mode === 'slots') return slotsNode(g);
   if (g.mode === 'roulette') return rouletteNode(g);
+  if (g.mode === 'beg') return begNode(g);
 
   const card = el('div', `game-card ${g.status}`.trim());
 
@@ -2290,6 +2402,12 @@ const COMMANDS = [
     run: () => doWork(),
   },
   {
+    name: '/beg',
+    args: '',
+    summary: 'Ask the room for donations, once every 30 minutes',
+    run: () => beg(),
+  },
+  {
     name: '/gif',
     args: '<search>',
     summary: 'Search Giphy and send a GIF',
@@ -2599,6 +2717,18 @@ async function spinRoulette(kind, bet, number, replace = null) {
 }
 
 const doWork = () => frontmanCard('work');
+
+async function beg() {
+  if (!state.activeChannelId) {
+    toast('Open a channel first.', 'error');
+    return;
+  }
+  try {
+    const data = await api('POST', `/api/channels/${state.activeChannelId}/beg`);
+    if (data.wallet) state.wallet = data.wallet;
+    pushMessage(data.message);
+  } catch (err) { toast(err.message, 'error'); }
+}
 
 // ------------------------------------------------------------------- shop
 

@@ -707,6 +707,16 @@ button { background:none; border:0; cursor:pointer; }
   color:rgba(255,255,255,.72);
 }
 
+/* ------------------------------------------------------------- begging */
+.game-card.beg { border-left-color:#9b7bd4; }
+.game-card.beg .game-title { color:#c3a8f0; }
+.beg-list { display:flex; flex-direction:column; gap:4px; margin:10px 0 4px; }
+.beg-row { display:flex; align-items:center; gap:8px; font-size:13.5px; }
+.beg-who { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+           white-space:nowrap; }
+.beg-amount { font-weight:650; color:#8ce0a8; flex:none; }
+.seat-flag.all-in-flag { color:#f8c57a; border-color:#7a5a1f; }
+
 .roulette-bets {
   display:grid; grid-template-columns:repeat(3, 1fr); gap:6px; margin-bottom:16px;
 }

@@ -217,6 +217,56 @@ check("the pot survives the street", table["pot"] == 400, table["pot"])
 check("folding leaves one player standing",
       (poker.fold(table, 2), poker.hand_over(table))[1])
 
+# ------------------------------------------------------ all in and side pots
+short = poker.new_table(1, 100)
+short["players"].append(poker.new_player(2))
+for p in short["players"]:
+    p["contributed"] = 100
+short["pot"] = 200
+poker.deal(short)
+
+# Player 1 has 50 left and faces a 200 bet: they put the 50 in and are all in.
+poker.raise_to(short, 2, 200)
+paid = poker.stay(short, 1, budget=50)
+me = poker.seat(short, 1)
+check("a short stack pays what it has", paid == 50, paid)
+check("and is marked all in", me["allIn"] is True, me)
+check("an all-in player owes nothing more", poker.owed(short, me) == 0)
+check("and is not folded", me["folded"] is False, me)
+check("the street can close over an all-in player",
+      poker.round_complete(short), short)
+
+# A raise behind them must not reopen a decision they cannot make.
+poker.advance(short)
+poker.raise_to(short, 2, 400)
+check("a raise doesn't put an all-in player back in the hot seat",
+      poker.seat(short, 1)["acted"] is True, poker.seat(short, 1))
+check("nor ask them for anything",
+      poker.owed(short, poker.seat(short, 1)) == 0)
+check("and they are still in it",
+      poker.seat(short, 1) in poker.active(short))
+
+# Side pots: you can only win from someone what you also put in.
+pots = poker.new_table(1, 0)
+pots["players"] = [poker.new_player(1), poker.new_player(2), poker.new_player(3)]
+contributions = {1: 100, 2: 1000, 3: 1000}
+for p in pots["players"]:
+    p["contributed"] = contributions[p["userId"]]
+pots["pot"] = sum(contributions.values())
+# Player 1 is all in for 100 and has the best hand of the three.
+hands = {
+    1: {"score": (8, (14,)), "name": "Straight flush", "cards": []},
+    2: {"score": (2, (5, 4)), "name": "Two pair", "cards": []},
+    3: {"score": (1, (9,)), "name": "Pair", "cards": []},
+}
+payouts = poker.award(pots, pots["players"], hands)
+check("the short stack wins only what it matched", payouts[1] == 300, payouts)
+check("the rest goes to the best of those who covered it",
+      payouts[2] == 1800, payouts)
+check("and the third player gets nothing", payouts[3] == 0, payouts)
+check("every chip in the pot is paid out",
+      sum(payouts.values()) == pots["pot"], (payouts, pots["pot"]))
+
 # Hand ranking still holds up.
 check("a flush beats a straight",
       poker.best_hand(["2♠", "5♠", "9♠", "J♠", "K♠", "3♥", "4♦"])["score"]

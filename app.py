@@ -2757,6 +2757,32 @@ def serialize_game(conn, row, viewer_id, balance=None):
     if mode == "poker":
         return serialize_poker(conn, row, viewer_id, balance)
 
+    if mode == "beg":
+        host = conn.execute("SELECT * FROM users WHERE id = ?", (row["host_id"],)).fetchone()
+        givers = {
+            d["userId"]: None for d in state.get("donations", [])
+        }
+        for uid in list(givers):
+            u = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+            givers[uid] = public_user(conn, u) if u else None
+        return {
+            "id": row["id"],
+            "messageId": row["message_id"],
+            "mode": "beg",
+            "status": "finished",
+            "botGave": state["botGave"],
+            "line": state["line"],
+            "balance": balance,
+            "donations": [
+                {"user": givers.get(d["userId"]), "amount": d["amount"]}
+                for d in state.get("donations", [])
+            ],
+            "raised": state["botGave"] + sum(d["amount"] for d in state.get("donations", [])),
+            "player": public_user(conn, host) if host else None,
+            "yourSeat": "host" if viewer_id == row["host_id"] else None,
+            "canGive": viewer_id != row["host_id"],
+        }
+
     if mode == "roulette":
         host = conn.execute("SELECT * FROM users WHERE id = ?", (row["host_id"],)).fetchone()
         return {
@@ -3126,6 +3152,7 @@ def serialize_poker(conn, row, viewer_id, balance=None):
             "acted": p["acted"],
             "contributed": p["contributed"],
             "street": p.get("street", 0),
+            "allIn": bool(p.get("allIn")),
             "isYou": mine,
         }
         if done and state["result"]:
@@ -3133,6 +3160,13 @@ def serialize_poker(conn, row, viewer_id, balance=None):
             if hand:
                 entry["hand"] = hand
             entry["won"] = p["userId"] in state["result"]["winners"]
+            # With side pots the winners don't all take the same amount, so
+            # each seat carries its own figure.
+            payouts = state["result"].get("payouts") or {}
+            entry["wonAmount"] = payouts.get(
+                str(p["userId"]),
+                state["result"]["share"] if entry["won"] else 0,
+            )
         seats.append(entry)
 
     me = poker.seat(state, viewer_id)
@@ -3362,8 +3396,13 @@ def settle_poker(conn, row, state):
     if fresh["settled"]:
         return
     result = state["result"]
-    winners = set(result["winners"])
-    share = result["share"]
+    # Side pots pay different players different amounts; a hand that ended in
+    # folds, and any card dealt before side pots existed, carries one figure
+    # for the single winner instead.
+    payouts = {int(uid): amount for uid, amount in (result.get("payouts") or {}).items()}
+    if not payouts:
+        payouts = {uid: result["share"] for uid in result["winners"]}
+
     with conn:
         conn.execute("UPDATE games SET settled = 1 WHERE id = ?", (row["id"],))
         for p in state["players"]:
@@ -3371,9 +3410,10 @@ def settle_poker(conn, row, state):
             if p.get("cpu"):
                 continue
             uid, staked = p["userId"], p["contributed"]
-            if uid in winners:
-                db.adjust_coins(conn, uid, share)
-                db.record_result(conn, uid, "win", share - staked, staked)
+            won = payouts.get(uid, 0)
+            if won:
+                db.adjust_coins(conn, uid, won)
+                db.record_result(conn, uid, "win", won - staked, staked)
             else:
                 db.record_result(conn, uid, "lose", -staked, staked)
 
@@ -3441,14 +3481,17 @@ def api_poker_action(req, game_id):
     if action == "fold":
         poker.fold(state, req.user["id"])
     else:
-        extra = 0
+        # Never a rejection for being short. Whatever they have left goes in
+        # and they are all in — being outbet by a deeper stack must not force
+        # somebody out of a pot they have already paid into.
+        budget = db.balance(req.conn, req.user["id"])
         if action == "raise":
             extra = raise_amount(req, state)
-        cost = price + extra
-        if cost > db.balance(req.conn, req.user["id"]):
-            raise HttpError(400, f"That costs {cost:,} Sana Coin and you can't cover it.")
-        spent = (poker.raise_to(state, req.user["id"], extra) if action == "raise"
-                 else poker.stay(state, req.user["id"]))
+            if price + extra > budget and price >= budget:
+                raise HttpError(400, "You have nothing left to raise with.")
+            spent = poker.raise_to(state, req.user["id"], extra, budget)
+        else:
+            spent = poker.stay(state, req.user["id"], budget)
         if spent:
             with req.conn:
                 db.adjust_coins(req.conn, req.user["id"], -spent)
@@ -3556,6 +3599,106 @@ def api_roulette(req, channel_id):
     msg_id = post_game_message(req, channel_id, cur.lastrowid)
     mark_read(req.conn, req.user["id"], channel_id, msg_id)
     return {"message": serialize_one(req.conn, msg_id, req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
+
+
+# What the Frontman says when it hands something over, and when it doesn't.
+BEG_GIVEN = [
+    "counts out a few coins without looking up",
+    "sighs, and drops something into your hat",
+    "pretends not to know you, then pays anyway",
+    "says this is the last time. It is not the last time",
+]
+BEG_REFUSED = [
+    "looks straight through you",
+    "checks its pockets. Theatrically. Finds nothing",
+    "says it gave at the office",
+    "recommends the slot machines instead",
+    "turns the sign around",
+]
+
+
+@route("POST", r"/api/channels/(\d+)/beg")
+def api_beg(req, channel_id):
+    """Cap in hand. The house rarely pays; the other players might."""
+    req.require_auth()
+    channel_id = int(channel_id)
+    channel_access_or_403(req, channel_id)
+
+    row = req.conn.execute(
+        "SELECT last_beg FROM users WHERE id = ?", (req.user["id"],)
+    ).fetchone()
+    waited = db.now() - row["last_beg"]
+    if waited < db.BEG_INTERVAL:
+        raise HttpError(
+            429, f"You've only just asked. Try again in {wait_text(db.BEG_INTERVAL - waited)}."
+        )
+
+    given = db.beg_roll()
+    state = {
+        "kind": "beg",
+        "botGave": given,
+        "line": secrets.choice(BEG_GIVEN if given else BEG_REFUSED),
+        # Every donation from a real player, in the order they came in.
+        "donations": [],
+    }
+    now = db.now()
+    with req.conn:
+        cur = req.conn.execute(
+            "INSERT INTO games (channel_id, mode, status, host_id, state, bet,"
+            " settled, created_at, updated_at) VALUES (?,?,?,?,?,0,1,?,?)",
+            (channel_id, "beg", "finished", req.user["id"], json.dumps(state), now, now),
+        )
+        req.conn.execute(
+            "UPDATE users SET last_beg = ? WHERE id = ?", (now, req.user["id"])
+        )
+        if given:
+            db.adjust_coins(req.conn, req.user["id"], given)
+
+    msg_id = post_game_message(req, channel_id, cur.lastrowid)
+    mark_read(req.conn, req.user["id"], channel_id, msg_id)
+    return {"message": serialize_one(req.conn, msg_id, req.user["id"]),
+            "wallet": wallet_payload(req.conn, req.user["id"])}
+
+
+MAX_DONATION = 1_000_000
+
+
+@route("POST", r"/api/games/(\d+)/beg/give")
+def api_beg_give(req, game_id):
+    """Give a beggar whatever you like, out of your own pocket."""
+    req.require_auth()
+    row = load_game(req, game_id)
+    if row["mode"] != "beg":
+        raise HttpError(400, "Nobody is begging there.")
+    if row["host_id"] == req.user["id"]:
+        raise HttpError(400, "Begging from yourself won't get you far.")
+
+    try:
+        amount = int(req.body.get("amount"))
+    except (TypeError, ValueError):
+        raise HttpError(400, "Say how much.")
+    if amount <= 0:
+        raise HttpError(400, "Give something, or give nothing.")
+    if amount > MAX_DONATION:
+        raise HttpError(400, f"The most you can give at once is {MAX_DONATION:,}.")
+    have = db.balance(req.conn, req.user["id"])
+    if amount > have:
+        raise HttpError(400, f"You only have {have:,} Sana Coin.")
+
+    state = json.loads(row["state"])
+    with req.conn:
+        db.adjust_coins(req.conn, req.user["id"], -amount)
+        db.adjust_coins(req.conn, row["host_id"], amount)
+        state.setdefault("donations", []).append(
+            {"userId": req.user["id"], "amount": amount}
+        )
+        req.conn.execute(
+            "UPDATE games SET state = ?, version = version + 1, updated_at = ?"
+            " WHERE id = ?",
+            (json.dumps(state), db.now(), row["id"]),
+        )
+    return {"message": serialize_one(req.conn, row["message_id"], req.user["id"]),
             "wallet": wallet_payload(req.conn, req.user["id"])}
 
 

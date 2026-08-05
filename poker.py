@@ -169,15 +169,23 @@ def new_player(user_id, cpu=False, name=None):
         "contributed": 0,
         # Put in during the current street only; reset when the street turns.
         "street": 0,
+        # Everything they had is in the middle. They stay in the hand and are
+        # never asked for another chip.
+        "allIn": False,
     }
 
 
 def owed(state, player):
     """What this player must put in to stay in the hand right now.
 
-    `.get` rather than `[]` on both: a table dealt before betting existed has
-    neither key, and reads as "nothing owed", which is what it was.
+    Nothing, once they are all in: they have no more to give, and a raise
+    behind them must not turn into a demand they cannot meet.
+
+    `.get` rather than `[]`: a table dealt before betting existed has neither
+    key, and reads as "nothing owed", which is what it was.
     """
+    if player.get("allIn"):
+        return 0
     return max(0, state.get("toMatch", 0) - player.get("street", 0))
 
 
@@ -241,7 +249,8 @@ def play_cpus(state):
     for _ in range(len(STAGES) * MAX_PLAYERS * 2):
         if state["stage"] in ("waiting", "showdown"):
             break
-        pending = [p for p in active(state) if p.get("cpu") and not p["acted"]]
+        pending = [p for p in active(state)
+                   if p.get("cpu") and not p["acted"] and not p.get("allIn")]
         if not pending:
             if hand_over(state) or round_complete(state):
                 advance(state)
@@ -286,35 +295,51 @@ def deal(state):
     return state
 
 
-def stay(state, user_id):
-    """Check (nothing owed) or call. Returns what it cost."""
+def stay(state, user_id, budget=None):
+    """Check (nothing owed) or call. Returns what it actually cost.
+
+    `budget` is what the player can afford. Short of the full price they go
+    all in for the rest — which is the whole point: being outbet by someone
+    with a deeper stack should not force you out of a hand you have already
+    paid into.
+    """
     p = seat(state, user_id)
-    cost = owed(state, p)
+    price = owed(state, p)
+    cost = price if budget is None else min(price, max(0, budget))
     p["acted"] = True
     p["street"] = p.get("street", 0) + cost
     p["contributed"] += cost
     state["pot"] += cost
+    if budget is not None and cost < price:
+        p["allIn"] = True
     return cost
 
 
-def raise_to(state, user_id, amount):
+def raise_to(state, user_id, amount, budget=None):
     """Call what's owed and put `amount` more on top. Returns the total cost.
 
     Everyone still in has to answer the new price, so their turn reopens —
     that is the whole point of a raise and the reason a round can go round
-    more than once.
+    more than once. Only players who can still act are reopened; anyone
+    already all in has nothing left to answer with.
     """
     p = seat(state, user_id)
-    cost = owed(state, p) + amount
+    wanted = owed(state, p) + amount
+    cost = wanted if budget is None else min(wanted, max(0, budget))
     p["acted"] = True
     p["street"] = p.get("street", 0) + cost
     p["contributed"] += cost
     state["pot"] += cost
-    state["toMatch"] = p["street"]
-    state["lastRaise"] = amount
-    for other in active(state):
-        if other is not p:
-            other["acted"] = False
+    if budget is not None and cost < wanted:
+        p["allIn"] = True
+    # Putting in less than the going rate is a call, not a raise: it sets no
+    # new price for anybody.
+    if p["street"] > state.get("toMatch", 0):
+        state["toMatch"] = p["street"]
+        state["lastRaise"] = amount
+        for other in active(state):
+            if other is not p and not other.get("allIn"):
+                other["acted"] = False
     return cost
 
 
@@ -326,8 +351,15 @@ def fold(state, user_id):
 
 
 def round_complete(state):
-    """Everyone left has acted and has matched the price."""
-    return all(p["acted"] and owed(state, p) == 0 for p in active(state))
+    """Everyone left has acted and has matched the price.
+
+    An all-in player is counted as done however the betting goes: `owed`
+    already reads zero for them, and nobody is waiting on a decision they
+    cannot make.
+    """
+    return all(p["acted"] or p.get("allIn") for p in active(state)) and all(
+        owed(state, p) == 0 for p in active(state)
+    )
 
 
 def hand_over(state):
@@ -358,7 +390,8 @@ def advance(state):
     state["toMatch"] = 0
     state["lastRaise"] = 0
     for p in state["players"]:
-        p["acted"] = p["folded"]
+        # All-in players sit the rest of the hand out without folding.
+        p["acted"] = p["folded"] or p.get("allIn", False)
         p["street"] = 0
     return state
 
@@ -382,14 +415,17 @@ def settle(state):
     for p in contenders:
         scored[p["userId"]] = best_hand(p["hole"] + state["board"])
 
+    payouts = award(state, contenders, scored)
     top = max(scored.values(), key=lambda h: h["score"])["score"]
     winners = [uid for uid, h in scored.items() if h["score"] == top]
-    share = state["pot"] // len(winners)
     name = next(h["name"] for h in scored.values() if h["score"] == top)
 
     state["result"] = {
-        "winners": winners,
-        "share": share,
+        "winners": [uid for uid in payouts if payouts[uid] > 0] or winners,
+        # Kept for cards written before side pots existed, which read a single
+        # figure. `payouts` is the real answer when it is there.
+        "share": max(payouts.values()) if payouts else 0,
+        "payouts": {str(uid): amount for uid, amount in payouts.items()},
         "text": f"{name} takes it" if len(winners) == 1 else f"Split pot — {name}",
         "hands": {
             str(uid): {"name": h["name"], "cards": h["cards"]}
@@ -397,3 +433,38 @@ def settle(state):
         },
     }
     return state
+
+
+def award(state, contenders, scored):
+    """Split the pot into side pots and give each one to the best hand in it.
+
+    You can only win from someone what you also put in. Somebody all in for
+    100 against two players who bet 5,000 wins 300 and no more; the rest is
+    fought over by the players who could still cover it. Folded chips stay in
+    the pot and are won by whoever the layer belongs to.
+
+    Returns {user_id: amount won}.
+    """
+    payouts = {p["userId"]: 0 for p in contenders}
+    # Each distinct contribution among the players still in marks the top of
+    # one layer of the pot.
+    levels = sorted({p["contributed"] for p in contenders if p["contributed"] > 0})
+    floor_ = 0
+    for level in levels:
+        # Everyone who reached this layer paid into it, folded or not.
+        amount = sum(
+            max(0, min(p["contributed"], level) - floor_) for p in state["players"]
+        )
+        eligible = [p for p in contenders if p["contributed"] >= level]
+        floor_ = level
+        if not amount or not eligible:
+            continue
+        best = max(scored[p["userId"]]["score"] for p in eligible)
+        takers = [p["userId"] for p in eligible if scored[p["userId"]]["score"] == best]
+        share, odd = divmod(amount, len(takers))
+        for uid in takers:
+            payouts[uid] += share
+        # An indivisible chip goes to the first of them rather than vanishing.
+        if odd:
+            payouts[takers[0]] += odd
+    return payouts

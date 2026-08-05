@@ -634,6 +634,23 @@ def collect_results(conn, user_id):
     }
 
 
+# --------------------------------------------------------------- begging
+
+# Cap in hand. The house is not generous, but other players might be.
+BEG_INTERVAL = 60 * 30
+BEG_CHANCE = 0.20              # how often the Frontman parts with anything
+BEG_MIN = 100
+BEG_MAX = 1_000
+
+
+def beg_roll():
+    """What the Frontman gives, which is usually nothing."""
+    rng = secrets.SystemRandom()
+    if rng.random() >= BEG_CHANCE:
+        return 0
+    return rng.randint(BEG_MIN, BEG_MAX)
+
+
 # ----------------------------------------------------------- hired help
 
 # E. Sawers turns up for a day and does an hour's work at a time. What he
@@ -1050,6 +1067,8 @@ def migrate(conn):
         # can tell who is applying. Shown only on the approval card and in
         # their own settings — never in the member list or on a message.
         conn.execute("ALTER TABLE users ADD COLUMN full_name TEXT NOT NULL DEFAULT ''")
+    if "last_beg" not in have:
+        conn.execute("ALTER TABLE users ADD COLUMN last_beg INTEGER NOT NULL DEFAULT 0")
     if "sawers_until" not in have:
         # When the hire runs out, and the last hour of his that was paid for.
         conn.execute("ALTER TABLE users ADD COLUMN sawers_until INTEGER NOT NULL DEFAULT 0")

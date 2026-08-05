@@ -248,6 +248,7 @@ ever posted survive the change.
 | `/slots <bet>` | Three weighted reels |
 | `/claim` | Collect 5,000 Sana Coin, once every 24 hours |
 | `/work` | Do a shift for Sana Coin, once an hour |
+| `/beg` | Ask the room for donations, once every 30 minutes |
 | `/shop` | Spend Sana Coin on permanent perks |
 | `/balance` | Your coins, rank and record |
 | `/bank` | Everyone's balances in this server |
@@ -265,6 +266,14 @@ without leaving the hand. Stakes are held out of your balance when a hand
 starts and paid out exactly once. Ranks (Rookie → Chancer →
 Hustler → Sharp → High Roller → Sana Legend) come from **wins, not balance**,
 so they can't simply be bought.
+
+### Begging
+
+`/beg` passes the hat, once every 30 minutes. The Frontman gives you something
+**one time in five** — 100 to 1,000, and a flat refusal the other four. Anyone
+else in the channel can hit **Give something** on the card and hand over
+whatever they like out of their own balance; every donation is listed on the
+card, and the total sits in the header.
 
 ### Working for it
 
@@ -292,6 +301,13 @@ puts money in and sets a price everyone else has to answer, which reopens the
 turn of anyone who had already acted; **Call** matches what's owed and **Fold**
 gets out. Raises go in whole antes, up to twenty at a time. Best five cards of
 your seven wins, and ties split the pot.
+
+**Being short doesn't put you out.** Call more than you can cover and you go
+**all in** for whatever is left, and that is the end of what anyone can ask of
+you — a raise behind you never reopens a decision you have no chips to make.
+The pot is then split into side pots on the standard rule: you can only win
+from someone what you also put in. All in for 100 against two players who bet
+5,000 wins you 300, and the rest is fought over by the players who covered it.
 
 ### Blackjack
 
