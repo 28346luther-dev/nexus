@@ -2114,6 +2114,12 @@ def wallet_payload(conn, user_id):
         "shiftsToRaise": db.shifts_to_raise(row["work_shifts"]),
         "workOdds": db.WORK_SUCCESS,
         "perks": sorted(perks),
+        "sawers": {
+            "price": db.SAWERS_PRICE,
+            "min": db.SAWERS_MIN,
+            "max": db.SAWERS_MAX,
+            "activeFor": db.sawers_left(conn, user_id),
+        },
         "lottery": {
             "price": db.LOTTERY_PRICE,
             "odds": db.LOTTERY_ODDS,
@@ -2145,7 +2151,11 @@ def api_wallet(req):
     won, handed over exactly once so it doesn't repeat on the next refresh.
     """
     req.require_auth()
+    # Settle E. Sawers first: the hours he worked while nobody was looking are
+    # part of the balance this call is about to report.
+    earnings = db.collect_sawers(req.conn, req.user["id"])
     payload = wallet_payload(req.conn, req.user["id"])
+    payload["sawersEarnings"] = earnings
     payload["lotteryResults"] = db.collect_results(req.conn, req.user["id"])
     return payload
 
@@ -2257,6 +2267,8 @@ def api_shop(req):
                 # A repeatable item is never "owned" — you can always buy more.
                 "owned": not item.get("repeatable") and item["id"] in owned,
                 "held": held if item["id"] == "lottery" else 0,
+                "activeFor": (db.sawers_left(req.conn, req.user["id"])
+                              if item.get("hire") else 0),
             }
             for item in db.SHOP_ITEMS
         ],
@@ -2288,7 +2300,9 @@ def api_buy(req):
             "UPDATE users SET coins = coins - ? WHERE id = ? AND coins >= ?",
             (item["price"], req.user["id"], item["price"]),
         )
-        if repeatable:
+        if item.get("hire"):
+            db.hire_sawers(req.conn, req.user["id"])
+        elif repeatable:
             db.buy_ticket(req.conn, req.user["id"], item["price"])
         else:
             req.conn.execute(
@@ -2424,6 +2438,62 @@ def api_reset_economy(req, guild_id):
     return {"reset": len(members), "startingCoins": db.STARTING_COINS}
 
 
+# The most an owner can move in one go. High enough to be useful, low enough
+# that a slipped keystroke doesn't wreck the leaderboard beyond repair.
+MAX_GIVE = 10_000_000
+
+
+@route("POST", r"/api/guilds/(\d+)/give")
+def api_give(req, guild_id):
+    """Hand Sana Coin to a member. Owner only, and silent by design.
+
+    Nothing is posted to the channel and the recipient is not told: the coins
+    simply appear in their balance. That is the whole point of the command —
+    an owner topping somebody up, or quietly taking it back, without it
+    becoming a scene in #general.
+
+    A negative amount takes coins away. Balances never go below zero.
+    """
+    req.require_auth()
+    guild_id = int(guild_id)
+    owner_only(req, guild_id)
+
+    try:
+        amount = int(req.body.get("amount"))
+    except (TypeError, ValueError):
+        raise HttpError(400, "Say how much, as a number.")
+    if amount == 0:
+        raise HttpError(400, "That would do nothing.")
+    if abs(amount) > MAX_GIVE:
+        raise HttpError(400, f"The most you can move at once is {MAX_GIVE:,}.")
+
+    try:
+        user_id = int(req.body.get("userId"))
+    except (TypeError, ValueError):
+        raise HttpError(400, "Pick who it's for.")
+    target = req.conn.execute(
+        "SELECT u.* FROM guild_members m JOIN users u ON u.id = m.user_id"
+        " WHERE m.guild_id = ? AND u.id = ?",
+        (guild_id, user_id),
+    ).fetchone()
+    if not target:
+        raise HttpError(404, "They're not in this server.")
+    if target["is_bot"]:
+        raise HttpError(400, "The Frontman has no use for it.")
+
+    before = db.balance(req.conn, user_id)
+    with req.conn:
+        db.adjust_coins(req.conn, user_id, amount)
+    after = db.balance(req.conn, user_id)
+    return {
+        "user": public_user(req.conn, target),
+        "amount": amount,
+        # What actually moved: taking 5,000 off someone holding 300 moves 300.
+        "moved": after - before,
+        "balance": after,
+    }
+
+
 @route("GET", r"/api/guilds/(\d+)/leaderboard")
 def api_leaderboard(req, guild_id):
     req.require_auth()
@@ -2484,6 +2554,7 @@ def serialize_game(conn, row, viewer_id, balance=None):
         host = conn.execute("SELECT * FROM users WHERE id = ?", (row["host_id"],)).fetchone()
         return {
             "id": row["id"],
+            "messageId": row["message_id"],
             "mode": "roulette",
             "status": "finished",
             "bet": row["bet"],
@@ -2503,6 +2574,7 @@ def serialize_game(conn, row, viewer_id, balance=None):
         host = conn.execute("SELECT * FROM users WHERE id = ?", (row["host_id"],)).fetchone()
         return {
             "id": row["id"],
+            "messageId": row["message_id"],
             "mode": "slots",
             "status": "finished",
             "bet": row["bet"],
@@ -2584,6 +2656,7 @@ def serialize_game(conn, row, viewer_id, balance=None):
 
     return {
         "id": row["id"],
+        "messageId": row["message_id"],
         "mode": mode,
         "status": status,
         "bet": row["bet"],
@@ -2681,7 +2754,16 @@ def settle_bets(conn, row, state):
 
 
 def post_game_message(req, channel_id, game_id):
-    """The bot posts the card that renders the game."""
+    """The bot posts the card that renders the game.
+
+    "Play again" hands in the card it was clicked on, and the new hand takes
+    that card over instead of adding another one below it — otherwise a run of
+    ten hands is ten near-identical cards filling the channel.
+    """
+    reused = reuse_card(req, channel_id, game_id)
+    if reused:
+        return reused
+
     bot = db.bot_id(req.conn)
     with req.conn:
         cur = req.conn.execute(
@@ -2693,6 +2775,49 @@ def post_game_message(req, channel_id, game_id):
             "UPDATE games SET message_id = ? WHERE id = ?", (cur.lastrowid, game_id)
         )
     return cur.lastrowid
+
+
+def reuse_card(req, channel_id, game_id):
+    """Point an existing card at a new game, or None if that isn't allowed.
+
+    Only the card's own player can take it over, and only once their hand has
+    finished — otherwise a live table could be pulled out from under the
+    people sitting at it.
+    """
+    raw = req.body.get("replace") if isinstance(req.body, dict) else None
+    if not raw:
+        return None
+    try:
+        message_id = int(raw)
+    except (TypeError, ValueError):
+        return None
+
+    msg = req.conn.execute(
+        "SELECT * FROM messages WHERE id = ? AND channel_id = ?",
+        (message_id, channel_id),
+    ).fetchone()
+    if not msg or not msg["game_id"]:
+        return None
+    old = req.conn.execute(
+        "SELECT * FROM games WHERE id = ?", (msg["game_id"],)
+    ).fetchone()
+    if not old or old["status"] != "finished" or old["host_id"] != req.user["id"]:
+        return None
+    if old["mode"] == "info":
+        return None                   # a wallet or leaderboard card, not a hand
+
+    with req.conn:
+        req.conn.execute(
+            "UPDATE messages SET game_id = ? WHERE id = ?", (game_id, message_id)
+        )
+        req.conn.execute(
+            "UPDATE games SET message_id = ? WHERE id = ?", (message_id, game_id)
+        )
+        # The old row is finished, settled and no longer on screen. It has to
+        # go after the message has been re-pointed, not before: a message
+        # whose game_id still referenced it would be cascaded away with it.
+        req.conn.execute("DELETE FROM games WHERE id = ?", (old["id"],))
+    return message_id
 
 
 @route("POST", r"/api/channels/(\d+)/games")
@@ -2807,6 +2932,7 @@ def serialize_poker(conn, row, viewer_id, balance=None):
     ante = state["ante"]
     return {
         "id": row["id"],
+        "messageId": row["message_id"],
         "mode": "poker",
         "status": row["status"],
         "stage": state["stage"],

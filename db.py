@@ -620,6 +620,74 @@ def collect_results(conn, user_id):
     }
 
 
+# ----------------------------------------------------------- hired help
+
+# E. Sawers turns up for a day and does an hour's work at a time. What he
+# comes back with is anyone's guess, but he always comes back with something.
+SAWERS_PRICE = 5_000
+SAWERS_MIN = 100
+SAWERS_MAX = 1_000
+SAWERS_HIRE = 60 * 60 * 24
+SAWERS_HOUR = 60 * 60
+
+
+def hire_sawers(conn, user_id):
+    """Take him on for a day. Hiring again while he's here extends the job."""
+    row = conn.execute(
+        "SELECT sawers_until, sawers_paid FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    running = row["sawers_until"] > now()
+    until = (row["sawers_until"] if running else now()) + SAWERS_HIRE
+    conn.execute(
+        # The clock only restarts if he wasn't already on: otherwise an hour
+        # halfway done would be thrown away by re-hiring him.
+        "UPDATE users SET sawers_until = ?, sawers_paid = ? WHERE id = ?",
+        (until, row["sawers_paid"] if running else now(), user_id),
+    )
+    return until
+
+
+def sawers_left(conn, user_id):
+    """Seconds left on the hire, or 0 if he isn't working for you."""
+    row = conn.execute(
+        "SELECT sawers_until FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    return max(0, (row["sawers_until"] if row else 0) - now())
+
+
+def collect_sawers(conn, user_id):
+    """Pay out the hours he has worked since you last looked.
+
+    He works while you're away, so this settles up lazily rather than needing
+    a timer per person: every whole hour between the last payout and now (or
+    the end of the hire, whichever came first) is rolled and paid.
+    """
+    row = conn.execute(
+        "SELECT sawers_until, sawers_paid FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if not row or not row["sawers_until"]:
+        return None
+    end = min(now(), row["sawers_until"])
+    hours = (end - row["sawers_paid"]) // SAWERS_HOUR
+    if hours <= 0:
+        return None
+    hours = min(hours, SAWERS_HIRE // SAWERS_HOUR)      # a day's work at most
+
+    rng = secrets.SystemRandom()
+    earned = sum(rng.randint(SAWERS_MIN, SAWERS_MAX) for _ in range(hours))
+    with conn:
+        conn.execute(
+            "UPDATE users SET coins = coins + ?, sawers_paid = sawers_paid + ?"
+            " WHERE id = ?",
+            (earned, hours * SAWERS_HOUR, user_id),
+        )
+    return {
+        "hours": hours,
+        "coins": earned,
+        "finished": now() >= row["sawers_until"],
+    }
+
+
 # ---------------------------------------------------------------- the shop
 
 # Perks are permanent and deliberately expensive: at 5,000 a day from /claim
@@ -637,6 +705,17 @@ SHOP_ITEMS = [
         "summary": f"One in {LOTTERY_ODDS} wins {LOTTERY_PRIZE:,}.",
         "detail": "Drawn once a day. Buy as many as you like — each one is its "
                   "own chance.",
+    },
+    {
+        "id": "sawers",
+        "name": "E. Sawers",
+        "price": SAWERS_PRICE,
+        "icon": "🧑‍🏭",
+        "repeatable": True,
+        "hire": True,
+        "summary": f"Works an hour at a time for {SAWERS_MIN:,}–{SAWERS_MAX:,}.",
+        "detail": "Hired for one day. He keeps working while you're away — the "
+                  "hours are waiting for you when you get back.",
     },
     {
         "id": "fedora",
@@ -869,6 +948,10 @@ def migrate(conn):
     if "work_shifts" not in have:
         # Hours on the clock, which is what earns the 20% rises.
         conn.execute("ALTER TABLE users ADD COLUMN work_shifts INTEGER NOT NULL DEFAULT 0")
+    if "sawers_until" not in have:
+        # When the hire runs out, and the last hour of his that was paid for.
+        conn.execute("ALTER TABLE users ADD COLUMN sawers_until INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE users ADD COLUMN sawers_paid INTEGER NOT NULL DEFAULT 0")
 
     have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)")}
     if "locked" not in have:

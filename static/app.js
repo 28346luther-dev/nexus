@@ -889,7 +889,7 @@ function slotsNode(g) {
   if (g.yourSeat) {
     const actions = el('div', 'game-actions');
     const again = el('button', 'btn small ghost', 'Spin again');
-    again.onclick = () => spinSlots(g.bet || 10);
+    again.onclick = () => spinSlots(g.bet || 10, g.messageId);
     actions.appendChild(again);
     card.appendChild(actions);
   }
@@ -995,7 +995,7 @@ function pokerNode(g) {
   if (g.stage === 'showdown' && g.youArePlaying) {
     const bots = g.seats.filter((s) => s.user && s.user.isBot).length;
     const again = el('button', 'btn small ghost', 'New hand');
-    again.onclick = () => startPoker(g.ante, bots);
+    again.onclick = () => startPoker(g.ante, bots, g.messageId);
     actions.appendChild(again);
   }
   if (actions.children.length) card.appendChild(actions);
@@ -1128,7 +1128,7 @@ function rouletteNode(g) {
   if (g.yourSeat) {
     const actions = el('div', 'game-actions');
     const again = el('button', 'btn small ghost', 'Spin again');
-    again.onclick = () => askRoulette(g.bet || 100);
+    again.onclick = () => askRoulette(g.bet || 100, g.messageId);
     actions.appendChild(again);
     card.appendChild(actions);
   }
@@ -1325,7 +1325,7 @@ function gameNode(m) {
   if (g.status === 'finished' && g.yourSeat !== null) {
     const again = el('button', 'btn small ghost',
       g.bet ? `Play again for ${coins(g.bet)}` : 'Play again');
-    again.onclick = () => startGame(g.mode, g.bet);
+    again.onclick = () => startGame(g.mode, g.bet, g.messageId);
     actions.appendChild(again);
   }
   if (actions.children.length) card.appendChild(actions);
@@ -2260,6 +2260,15 @@ const COMMANDS = [
     run: (n) => confirmPurge(n),
   },
   {
+    name: '/give',
+    args: '<amount>',
+    summary: 'Quietly hand someone Sana Coin — server owner only',
+    takesNumber: true,
+    optionalNumber: true,
+    ownerOnly: true,
+    run: (amount) => openGiveDialog(amount),
+  },
+  {
     name: '/reset',
     args: '',
     summary: 'Wipe balances and the leaderboard — server owner only',
@@ -2304,6 +2313,89 @@ function confirmPurge(count) {
     });
 }
 
+/** Owner-only, and nothing about it reaches the channel. */
+async function openGiveDialog(preset) {
+  const guild = state.guilds.find((g) => g.id === state.activeGuildId);
+  if (!guild || !guild.isOwner) {
+    toast('Only the owner of a server can do that.', 'error');
+    return;
+  }
+
+  let members = [];
+  try {
+    const data = await api('GET', `/api/guilds/${guild.id}/members`);
+    members = data.members.filter((m) => !m.isBot);
+  } catch (err) { return toast(err.message, 'error'); }
+  if (!members.length) return toast('Nobody to give anything to.', 'error');
+
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Give Sana Coin'));
+    box.appendChild(el('p', 'sub',
+      'Nothing is posted and nobody is told — the coins just turn up in their '
+      + 'balance. A negative amount takes it back.'));
+
+    const form = el('form');
+
+    const whoLabel = el('label', 'field');
+    whoLabel.appendChild(el('span', null, 'Who'));
+    const who = el('select');
+    members.forEach((m) => {
+      const opt = el('option', null, `${m.username}#${m.discriminator}`);
+      opt.value = String(m.id);
+      who.appendChild(opt);
+    });
+    whoLabel.appendChild(who);
+    form.appendChild(whoLabel);
+
+    const amountLabel = el('label', 'field');
+    amountLabel.appendChild(el('span', null, 'Amount'));
+    const amount = el('input');
+    amount.type = 'number';
+    amount.value = String(preset != null ? preset : 10000);
+    amountLabel.appendChild(amount);
+    form.appendChild(amountLabel);
+
+    const quick = el('div', 'stake-quick');
+    [1000, 10000, 100000, 1000000].forEach((n) => {
+      const b = el('button', 'btn small ghost', n.toLocaleString());
+      b.type = 'button';
+      b.onclick = () => { amount.value = String(n); };
+      quick.appendChild(b);
+    });
+    const flip = el('button', 'btn small ghost', '±');
+    flip.type = 'button';
+    flip.title = 'Take it away instead';
+    flip.onclick = () => { amount.value = String(-(parseInt(amount.value, 10) || 0)); };
+    quick.appendChild(flip);
+    form.appendChild(quick);
+
+    const actions = el('div', 'modal-actions');
+    const cancel = el('button', 'btn ghost', 'Cancel');
+    cancel.type = 'button';
+    cancel.onclick = close;
+    const go = el('button', 'btn primary', 'Give');
+    actions.append(cancel, go);
+    form.appendChild(actions);
+
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const n = parseInt(amount.value, 10);
+      if (!n) return toast('Enter an amount.', 'error');
+      go.disabled = true;
+      try {
+        const data = await api('POST', `/api/guilds/${guild.id}/give`,
+          { userId: Number(who.value), amount: n });
+        close();
+        const verb = data.amount > 0 ? 'Gave' : 'Took';
+        toast(`${verb} ${Math.abs(data.moved).toLocaleString()} ${COIN} `
+          + `${data.amount > 0 ? 'to' : 'from'} ${data.user.username}. `
+          + `They now hold ${data.balance.toLocaleString()}.`, 'ok');
+      } catch (err) { toast(err.message, 'error'); go.disabled = false; }
+    };
+    box.appendChild(form);
+  });
+}
+
 function confirmReset() {
   const guild = state.guilds.find((g) => g.id === state.activeGuildId);
   if (!guild || !guild.isOwner) {
@@ -2336,7 +2428,7 @@ const ROULETTE_BETS = [
 ];
 
 /** Pick what you're backing, then how much. */
-async function askRoulette(preset) {
+async function askRoulette(preset, replace = null) {
   if (!state.activeChannelId) {
     toast('Open a channel first.', 'error');
     return;
@@ -2422,18 +2514,18 @@ async function askRoulette(preset) {
         return toast('Pick a number from 0 to 36.', 'error');
       }
       close();
-      spinRoulette(chosen, n, number);
+      spinRoulette(chosen, n, number, replace);
     };
     box.appendChild(form);
   });
 }
 
-async function spinRoulette(kind, bet, number) {
+async function spinRoulette(kind, bet, number, replace = null) {
   try {
     const data = await api('POST', `/api/channels/${state.activeChannelId}/roulette`,
-      { kind, bet, number });
+      { kind, bet, number, replace });
     if (data.wallet) state.wallet = data.wallet;
-    pushMessage(data.message);
+    landCard(data.message, replace);
   } catch (err) { toast(err.message, 'error'); }
 }
 
@@ -2449,7 +2541,8 @@ async function openShop() {
   openModal((box, close) => {
     box.appendChild(el('h2', null, 'Sana Coin shop'));
     box.appendChild(el('p', 'sub',
-      `The perks are permanent; the ticket is a gamble. You have ${coins(data.coins)}.`));
+      'The perks are permanent. The ticket and the hire are not. '
+      + `You have ${coins(data.coins)}.`));
 
     const list = el('div', 'shop-list');
     data.items.forEach((item) => {
@@ -2459,12 +2552,19 @@ async function openShop() {
       const text = el('div', 'shop-text');
       text.appendChild(el('strong', null, item.name));
       text.appendChild(el('div', 'muted', item.summary));
-      text.appendChild(el('small', 'shop-detail', item.repeatable
+      // The draw countdown belongs to the ticket, not to everything you can
+      // buy more than once.
+      text.appendChild(el('small', 'shop-detail', item.id === 'lottery'
         ? `${item.detail} Next draw in ${formatWait(data.drawIn)}.`
         : item.detail));
       if (item.held) {
         text.appendChild(el('small', 'shop-held',
           `You hold ${item.held} ticket${item.held === 1 ? '' : 's'} for it.`));
+      }
+      if (item.activeFor) {
+        text.appendChild(el('small', 'shop-held',
+          `On the job — ${formatWait(item.activeFor)} left. Hiring him again `
+          + 'adds another day.'));
       }
       row.appendChild(text);
 
@@ -2492,8 +2592,13 @@ async function buyTicket(item, close) {
       { item: item.id, channelId: state.activeChannelId || undefined });
     if (data.wallet) state.wallet = data.wallet;
     if (data.message) pushMessage(data.message);
-    const held = data.wallet && data.wallet.lottery ? data.wallet.lottery.tickets : 1;
-    toast(`Ticket bought — you hold ${held} for the next draw.`, 'ok');
+    if (item.hire) {
+      const left = data.wallet && data.wallet.sawers ? data.wallet.sawers.activeFor : 0;
+      toast(`${item.name} starts work — ${formatWait(left)} on the clock.`, 'ok');
+    } else {
+      const held = data.wallet && data.wallet.lottery ? data.wallet.lottery.tickets : 1;
+      toast(`Ticket bought — you hold ${held} for the next draw.`, 'ok');
+    }
     close();
     openShop();                       // reopen with the new count and balance
   } catch (err) { toast(err.message, 'error'); }
@@ -2692,23 +2797,33 @@ async function askStake(title, preset, onConfirm, min = 0) {
   });
 }
 
-async function startGame(mode, bet = 0) {
+/** `replace` is the card a "Play again" was clicked on: the new hand takes
+    it over instead of adding another card to the channel. */
+async function startGame(mode, bet = 0, replace = null) {
   if (!state.activeChannelId) return;
   try {
     const data = await api('POST', `/api/channels/${state.activeChannelId}/games`,
-      { mode, bet });
+      { mode, bet, replace });
     if (data.wallet) state.wallet = data.wallet;
-    pushMessage(data.message);
+    landCard(data.message, replace);
   } catch (err) { toast(err.message, 'error'); }
 }
 
-async function startPoker(bet, bots) {
+/** Swap the card in place when it was replayed, otherwise post a new one.
+    replaceMessage already falls back to appending if the server declined to
+    reuse the card and gave us a fresh message. */
+function landCard(message, replace) {
+  if (replace) replaceMessage(message);
+  else pushMessage(message);
+}
+
+async function startPoker(bet, bots, replace = null) {
   if (!state.activeChannelId) return;
   try {
     const data = await api('POST', `/api/channels/${state.activeChannelId}/poker`,
-      { bet, bots });
+      { bet, bots, replace });
     if (data.wallet) state.wallet = data.wallet;
-    pushMessage(data.message);
+    landCard(data.message, replace);
   } catch (err) { toast(err.message, 'error'); }
 }
 
@@ -2847,13 +2962,13 @@ async function sendGif(gif) {
   } catch (err) { toast(err.message, 'error'); }
 }
 
-async function spinSlots(bet) {
+async function spinSlots(bet, replace = null) {
   if (!state.activeChannelId) return;
   try {
     const data = await api('POST', `/api/channels/${state.activeChannelId}/slots`,
-      { bet });
+      { bet, replace });
     if (data.wallet) state.wallet = data.wallet;
-    pushMessage(data.message);
+    landCard(data.message, replace);
   } catch (err) { toast(err.message, 'error'); }
 }
 
@@ -3322,11 +3437,20 @@ async function refreshSidebarData() {
   ]);
   if (wallet) {
     state.wallet = wallet;
+    announceSawers(wallet.sawersEarnings);
     announceLottery(wallet.lotteryResults);
   }
   state.guilds = guilds.guilds;
   state.dms = dms.dms;
   state.friends = friends;
+}
+
+/** What E. Sawers brought back while you were away. Handed over once. */
+function announceSawers(earnings) {
+  if (!earnings || !earnings.hours) return;
+  const h = earnings.hours;
+  toast(`🧑‍🏭 E. Sawers worked ${h} hour${h === 1 ? '' : 's'} — `
+    + `${coins(earnings.coins)}.${earnings.finished ? " That's him done." : ''}`, 'ok');
 }
 
 /** Your own half of the draw. The server hands each result over once. */

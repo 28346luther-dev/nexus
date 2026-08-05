@@ -53,9 +53,14 @@ check("shop ids are unique",
       len({i["id"] for i in db.SHOP_ITEMS}) == len(db.SHOP_ITEMS))
 check("the nameplate is 100,000", db.SHOP_BY_ID["glow"]["price"] == 100_000)
 check("the lounge is 1,000,000", db.SHOP_BY_ID["lounge"]["price"] == 1_000_000)
-check("only the lottery ticket can be bought twice",
-      [i["id"] for i in db.SHOP_ITEMS if i.get("repeatable")] == ["lottery"],
+check("the ticket and the hire are the repeatable ones",
+      sorted(i["id"] for i in db.SHOP_ITEMS if i.get("repeatable"))
+      == ["lottery", "sawers"],
       [i["id"] for i in db.SHOP_ITEMS if i.get("repeatable")])
+check("E. Sawers costs 5,000", db.SAWERS_PRICE == 5_000)
+check("he pays between 100 and 1,000 an hour",
+      (db.SAWERS_MIN, db.SAWERS_MAX) == (100, 1_000))
+check("he is hired for exactly a day", db.SAWERS_HIRE == 86_400)
 
 # ---------------------------------------------------------------- lottery
 check("a ticket is 500", db.LOTTERY_PRICE == 500)

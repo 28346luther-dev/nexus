@@ -186,6 +186,17 @@ or cancelled; if two people request each other, it auto-accepts.
 
 **Direct messages** — one-to-one conversations with unread badges.
 
+**One card per game** — "Play again" reuses the card it was clicked on rather
+than posting another one, so a run of ten hands is one card that keeps
+changing instead of ten near-identical cards filling the channel. Only the
+player whose card it is can take it over, and only once that hand has
+finished.
+
+**`/give`** — the server owner can hand a member Sana Coin, or take it back
+with a negative amount. The command is hidden from everyone else and refused
+by the server if called directly. Nothing is posted and the recipient is not
+notified: the coins simply appear in their balance.
+
 **Frontman (games and Sana Coin)** — a masked bot account that joins every
 server automatically, including ones created before it existed. Everything it
 does is driven by slash commands and answered as a card in the channel. Type
@@ -211,6 +222,7 @@ ever posted survive the change.
 | `/bank` | Everyone's balances in this server |
 | `/leaderboard` | Top players by games won |
 | `/poll <question>` | Put a question to the channel and count the votes |
+| `/give [amount]` | Quietly hand a member Sana Coin — server owner only |
 | `/reset` | Wipe balances and records back to the start — server owner only |
 
 Leave the bet off and you get a **"How much would you like to bet?"** dialog
@@ -275,6 +287,7 @@ Lounge is something you win at the tables, not something you save up for.
 | Item | Price | What it does |
 |---|---|---|
 | Lottery ticket | 500 | One in 300 wins 100,000. Buy as many as you like |
+| E. Sawers | 5,000 | Works an hour at a time for 100–1,000, for one day |
 | Fedora | 10,000 | A hat on your avatar. Off and on again in Settings |
 | Glowing nameplate | 100,000 | Your name glows in chat, the member list and every leaderboard |
 | VIP badge | 150,000 | A gold VIP tag beside your name |
@@ -287,6 +300,12 @@ The **Sana Lounge** appears in every server you are in, now and later, and only
 for people who hold a key — **not even the server owner can see it** without
 one, and it can't be deleted or dragged around. `/reset` levels balances and
 records but leaves perks alone: they were paid for.
+
+**E. Sawers** is hired for a day and does an hour's work at a time, each hour
+paying anything from 100 to 1,000 with equal odds. He keeps working while
+you're away — the hours are settled the next time you look at your wallet, so
+a day's absence pays a day's work. Hiring him again while he's still on adds
+another day to the end rather than restarting the clock.
 
 The **fedora** is the one thing you can put away. It sits on your avatar
 wherever the avatar appears, and the toggle in *Settings* takes it off and puts

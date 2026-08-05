@@ -163,6 +163,70 @@ check("the gold pass doubles the daily claim",
       r["wallet"]["dailyAmount"] == 10_000, r["wallet"])
 check("the gold pass doubles the shift", r["wallet"]["workPay"] == 1000, r["wallet"])
 
+# =============================================================== E. Sawers
+s, r = member.call("GET", "/api/shop")
+hire = next(i for i in r["items"] if i["id"] == "sawers")
+check("the shop hires E. Sawers for 5,000", hire["price"] == 5000, hire)
+check("he can be hired again and again", hire["repeatable"] is True, hire)
+check("he isn't working to begin with", hire["activeFor"] == 0, hire)
+
+_, before = member.call("GET", "/api/wallet")
+s, r = member.call("POST", "/api/shop/buy", {"item": "sawers"})
+check("he can be hired", s == 200, r)
+check("the hire is paid for", r["wallet"]["coins"] == before["coins"] - 5000,
+      (before["coins"], r["wallet"]["coins"]))
+day = r["wallet"]["sawers"]["activeFor"]
+check("he is hired for a day", 86_000 <= day <= 86_400, day)
+check("the wallet quotes his rate",
+      r["wallet"]["sawers"]["min"] == 100 and r["wallet"]["sawers"]["max"] == 1000,
+      r["wallet"]["sawers"])
+
+_, r = member.call("GET", "/api/wallet")
+check("he isn't paid before he's worked an hour",
+      r["sawersEarnings"] is None, r["sawersEarnings"])
+
+# Wind his last payout back so there are finished hours waiting.
+conn = sqlite3.connect(DB_PATH)
+conn.execute("UPDATE users SET sawers_paid = sawers_paid - ? WHERE id = ?",
+             (3 * 3600 + 60, member.uid))
+conn.commit()
+conn.close()
+
+_, held = member.call("GET", "/api/wallet")
+earnings = held["sawersEarnings"]
+check("he hands over the hours he worked", earnings and earnings["hours"] == 3,
+      earnings)
+check("each hour pays between 100 and 1,000",
+      earnings and 3 * 100 <= earnings["coins"] <= 3 * 1000, earnings)
+check("the coins are actually in the balance",
+      held["coins"] == before["coins"] - 5000 + earnings["coins"],
+      (before["coins"], held["coins"], earnings))
+_, again = member.call("GET", "/api/wallet")
+check("the same hours aren't paid twice", again["sawersEarnings"] is None, again)
+
+# Re-hiring while he is still on adds to the end rather than restarting.
+left = again["sawers"]["activeFor"]
+s, r = member.call("POST", "/api/shop/buy", {"item": "sawers"})
+check("hiring him again extends the day",
+      r["wallet"]["sawers"]["activeFor"] >= left + 86_000,
+      (left, r["wallet"]["sawers"]["activeFor"]))
+
+# Once the hire is over he stops, however long you leave it.
+conn = sqlite3.connect(DB_PATH)
+conn.execute("UPDATE users SET sawers_until = ?, sawers_paid = ? WHERE id = ?",
+             (int(time.time()) - 7200, int(time.time()) - 7200 - 3600, member.uid))
+conn.commit()
+conn.close()
+_, r = member.call("GET", "/api/wallet")
+check("he works up to the end of the hire and no further",
+      r["sawersEarnings"] is not None and r["sawersEarnings"]["hours"] == 1,
+      r["sawersEarnings"])
+check("and is marked finished", r["sawersEarnings"]["finished"] is True,
+      r["sawersEarnings"])
+_, r = member.call("GET", "/api/wallet")
+check("an expired hire pays nothing more", r["sawersEarnings"] is None, r)
+check("and shows no time left", r["sawers"]["activeFor"] == 0, r["sawers"])
+
 # ================================================================== fedora
 s, me = member.call("GET", "/api/me")
 check("nothing is worn to begin with", me["user"]["decoration"] == "", me["user"])
@@ -338,6 +402,54 @@ s, r = owner.call("POST", f"/api/polls/{multi['id']}/close")
 check("the author can close a poll", s == 200 and r["message"]["poll"]["closed"], r)
 s, r = owner.call("POST", f"/api/polls/{multi['id']}/vote", {"choice": 1})
 check("a closed poll takes no more votes", s == 409, (s, r))
+
+# ==================================================================== give
+_, before = member.call("GET", "/api/wallet")
+msgs_before = len(owner.call("GET", f"/api/channels/{cid}/messages")[1]["messages"])
+
+s, r = member.call("POST", f"/api/guilds/{gid}/give",
+                   {"userId": owner.uid, "amount": 100})
+check("only the owner can give", s == 403, (s, r))
+
+s, r = owner.call("POST", f"/api/guilds/{gid}/give",
+                  {"userId": member.uid, "amount": 25_000})
+check("the owner can give", s == 200, r)
+check("the coins arrive", r["balance"] == before["coins"] + 25_000,
+      (before["coins"], r["balance"]))
+_, after = member.call("GET", "/api/wallet")
+check("and the recipient's wallet agrees", after["coins"] == before["coins"] + 25_000,
+      after["coins"])
+
+msgs_after = owner.call("GET", f"/api/channels/{cid}/messages")[1]["messages"]
+check("nothing is posted about it", len(msgs_after) == msgs_before,
+      (msgs_before, len(msgs_after)))
+check("and nobody is pinged about it",
+      not any(m["mentionsMe"] for m in msgs_after[msgs_before:]), msgs_after)
+
+s, r = owner.call("POST", f"/api/guilds/{gid}/give",
+                  {"userId": member.uid, "amount": -5_000})
+check("a negative amount takes it back", r["balance"] == after["coins"] - 5_000,
+      (after["coins"], r["balance"]))
+
+s, r = owner.call("POST", f"/api/guilds/{gid}/give",
+                  {"userId": member.uid, "amount": 0})
+check("nothing is not an amount", s == 400, (s, r))
+s, r = owner.call("POST", f"/api/guilds/{gid}/give",
+                  {"userId": member.uid, "amount": 99_000_000_000})
+check("there is a ceiling on it", s == 400, (s, r))
+s, r = owner.call("POST", f"/api/guilds/{gid}/give",
+                  {"userId": outsider.uid, "amount": 100})
+check("you can't give to someone outside the server", s == 404, (s, r))
+
+# Taking more than they hold empties them rather than going negative.
+_, held = member.call("GET", "/api/wallet")
+s, r = owner.call("POST", f"/api/guilds/{gid}/give",
+                  {"userId": member.uid, "amount": -(held["coins"] + 50_000)})
+check("balances never go negative", r["balance"] == 0, r)
+check("and the reply says what really moved", r["moved"] == -held["coins"],
+      (r["moved"], held["coins"]))
+owner.call("POST", f"/api/guilds/{gid}/give",
+           {"userId": member.uid, "amount": held["coins"]})
 
 # =================================================================== reset
 _, w = member.call("GET", "/api/wallet")

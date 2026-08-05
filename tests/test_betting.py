@@ -233,6 +233,47 @@ check("a straight number pays 35 to 1", spin["pays"] == 35, spin)
 check("a straight number only wins on itself",
       (spin["profit"] > 0) == (spin["number"] == 17), spin)
 
+# ======================================================= one card, replayed
+def cards_in_channel(client):
+    _, r = client.call("GET", f"/api/channels/{cid}/messages")
+    return [m for m in r["messages"] if m.get("game")]
+
+
+start = len(cards_in_channel(host))
+_, r = host.call("POST", f"/api/channels/{cid}/slots", {"bet": 10})
+first = r["message"]
+check("a spin posts a card", len(cards_in_channel(host)) == start + 1)
+check("the card knows its own message",
+      first["game"]["messageId"] == first["id"], first["game"])
+
+_, r = host.call("POST", f"/api/channels/{cid}/slots",
+                 {"bet": 10, "replace": first["id"]})
+check("replaying reuses the same card", r["message"]["id"] == first["id"],
+      (first["id"], r["message"]["id"]))
+check("and doesn't add another", len(cards_in_channel(host)) == start + 1,
+      len(cards_in_channel(host)))
+check("the card shows the new spin",
+      r["message"]["game"]["id"] != first["game"]["id"], r["message"]["game"])
+
+_, r = host.call("POST", f"/api/channels/{cid}/slots", {"bet": 10})
+check("an ordinary spin still posts its own card",
+      len(cards_in_channel(host)) == start + 2, len(cards_in_channel(host)))
+
+# Somebody else's card is not yours to take over.
+mine = cards_in_channel(host)[-1]
+_, r = p2.call("POST", f"/api/channels/{cid}/slots",
+               {"bet": 10, "replace": mine["id"]})
+check("you can't replay someone else's card", r["message"]["id"] != mine["id"],
+      (mine["id"], r["message"]["id"]))
+
+# Nor a hand that is still being played.
+_, r = host.call("POST", f"/api/channels/{cid}/games", {"mode": "pvp", "bet": 10})
+live = r["message"]
+_, r = host.call("POST", f"/api/channels/{cid}/slots",
+                 {"bet": 10, "replace": live["id"]})
+check("you can't replay a table that's still open",
+      r["message"]["id"] != live["id"], (live["id"], r["message"]["id"]))
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED: " + ", ".join(FAIL))
