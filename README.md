@@ -191,6 +191,20 @@ app. `/api/signups` lists everyone still waiting, for catching up after a
 break. Declining keeps the record, so a refused address can't just sign up
 again.
 
+**Managing members.** *Settings (⚙ next to your name) → Manage members* is
+the administrator's list of every account on the site: the name they gave, tag,
+email, whether they are in or still waiting, what they hold, how many servers
+they own and how many messages they have written. Each row has a **Delete**
+button — except your own, which is disabled, so the site can't be left without
+an administrator.
+
+Deleting is thorough and cannot be undone. The account goes, and with it every
+server they own — including all the channels and messages inside those, which
+belong to other people — plus their messages elsewhere, balance, perks, record
+and sessions. Images they uploaded are removed from disk too, since files have
+no foreign key to follow. The confirmation spells out exactly what will go
+before you agree to it.
+
 **Everyone who already had an account is approved automatically** — the column
 defaults to "in", so deploying this locks out nobody who was already using the
 site.

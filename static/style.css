@@ -1164,3 +1164,33 @@ button { background:none; border:0; cursor:pointer; }
   display:flex; justify-content:space-between; margin-top:6px;
   font-size:11.5px; color:var(--text-mute);
 }
+
+/* ------------------------------------------------------ admin panel */
+.admin-strip {
+  display:flex; align-items:center; gap:12px; background:var(--bg-0);
+  border:1px solid var(--line); border-radius:8px; padding:12px 14px;
+  margin-bottom:16px;
+}
+.admin-strip > div { flex:1; }
+.admin-strip strong { display:block; font-size:14px; }
+.admin-strip small { display:block; margin-top:2px; color:var(--text-mute); font-size:12px; }
+
+.admin-list { display:flex; flex-direction:column; gap:6px; max-height:50vh; overflow-y:auto; }
+.admin-row {
+  display:flex; align-items:center; gap:12px; padding:10px 12px;
+  background:var(--bg-0); border:1px solid transparent; border-radius:8px;
+}
+.admin-row.waiting { border-color:#7a5a1f; }
+.admin-who { flex:1; min-width:0; }
+.admin-line { display:flex; align-items:center; gap:7px; min-width:0; }
+.admin-line strong { font-size:14.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.admin-who small { display:block; font-size:11.5px; color:var(--text-dim);
+                   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.admin-who small.muted { color:var(--text-mute); }
+.admin-tag {
+  font-size:9.5px; font-weight:800; letter-spacing:.5px; padding:1px 4px;
+  border-radius:3px; flex:none; background:var(--accent); color:#fff;
+}
+.admin-tag.waiting { background:var(--yellow); color:#241a03; }
+.admin-tag.you { background:var(--bg-4); color:var(--text-dim); }
+.admin-row .btn { flex:none; }

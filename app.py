@@ -1949,6 +1949,119 @@ def admin_only(req):
         raise HttpError(403, "Only an administrator can do that.")
 
 
+@route("GET", r"/api/admin/users")
+def api_admin_users(req):
+    """Every account on the site, for the administrator's panel.
+
+    Carries what somebody needs in order to decide about an account: who they
+    are, whether they are in, and how much of the site would go with them.
+    """
+    req.require_auth()
+    admin_only(req)
+    rows = req.conn.execute(
+        "SELECT u.*,"
+        "  (SELECT COUNT(*) FROM guilds g WHERE g.owner_id = u.id) owns,"
+        "  (SELECT COUNT(*) FROM guild_members m WHERE m.user_id = u.id) member_of,"
+        "  (SELECT COUNT(*) FROM messages ms WHERE ms.author_id = u.id) messages"
+        " FROM users u WHERE u.is_bot = 0 ORDER BY u.id"
+    ).fetchall()
+    return {
+        "users": [
+            {
+                "id": r["id"],
+                "username": r["username"],
+                "discriminator": r["discriminator"],
+                "tag": f'{r["username"]}#{r["discriminator"]}',
+                "fullName": r["full_name"],
+                "email": r["email"],
+                "color": r["color"],
+                "avatarUrl": db.avatar_url(r),
+                "isAdmin": bool(r["is_admin"]),
+                "approved": bool(r["approved"]),
+                "coins": r["coins"],
+                "createdAt": r["created_at"],
+                "lastSeen": r["last_seen"],
+                "online": db.is_online(r),
+                "owns": r["owns"],
+                "memberOf": r["member_of"],
+                "messages": r["messages"],
+                "isYou": r["id"] == req.user["id"],
+            }
+            for r in rows
+        ]
+    }
+
+
+@route("DELETE", r"/api/admin/users/(\d+)")
+def api_admin_delete_user(req, user_id):
+    """Delete an account and everything that belongs to it.
+
+    Rows cascade from the users row, which includes the servers they own —
+    and every channel and message inside those. Files on disk have no foreign
+    key to follow, so their images and avatar are cleared up here by hand.
+    """
+    req.require_auth()
+    admin_only(req)
+    user_id = int(user_id)
+    if user_id == req.user["id"]:
+        raise HttpError(400, "You can't delete your own account from here.")
+
+    row = req.conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not row:
+        raise HttpError(404, "No such account.")
+    if row["is_bot"]:
+        raise HttpError(400, "The Frontman isn't going anywhere.")
+
+    # Everything they uploaded, plus everything uploaded to the servers they
+    # own — those servers are about to cascade away with them.
+    files = [
+        r["stored_name"]
+        for r in req.conn.execute(
+            "SELECT a.stored_name FROM attachments a"
+            " JOIN messages m ON m.id = a.message_id"
+            " WHERE m.author_id = ?"
+            " UNION"
+            " SELECT a.stored_name FROM attachments a"
+            " JOIN messages m ON m.id = a.message_id"
+            " JOIN channels c ON c.id = m.channel_id"
+            " JOIN guilds g ON g.id = c.guild_id"
+            " WHERE g.owner_id = ?",
+            (user_id, user_id),
+        )
+    ]
+    icons = [
+        r["icon"] for r in req.conn.execute(
+            "SELECT icon FROM guilds WHERE owner_id = ? AND icon IS NOT NULL",
+            (user_id,),
+        )
+    ]
+    stickers = [
+        r["stored_name"] for r in req.conn.execute(
+            "SELECT s.stored_name FROM stickers s JOIN guilds g ON g.id = s.guild_id"
+            " WHERE g.owner_id = ?",
+            (user_id,),
+        )
+    ]
+    if row["avatar"]:
+        files.append(row["avatar"])
+
+    summary = {
+        "tag": f'{row["username"]}#{row["discriminator"]}',
+        "servers": req.conn.execute(
+            "SELECT COUNT(*) c FROM guilds WHERE owner_id = ?", (user_id,)
+        ).fetchone()["c"],
+        "messages": req.conn.execute(
+            "SELECT COUNT(*) c FROM messages WHERE author_id = ?", (user_id,)
+        ).fetchone()["c"],
+    }
+
+    with req.conn:
+        req.conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    for name in files + icons + stickers:
+        discard_upload(name)
+    return {"deleted": summary}
+
+
 @route("GET", r"/api/signups")
 def api_signups(req):
     """Everyone still waiting. The admin's list, for catching up."""

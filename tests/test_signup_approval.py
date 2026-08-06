@@ -173,6 +173,57 @@ s, r = turned.call("POST", "/api/register", {
     "password": "hunter2hunter2", "fullName": "Someone Else"})
 check("and can't simply sign up again", s == 409, (s, r))
 
+# ------------------------------------------------------- the admin panel
+s, r = joiner.call("GET", "/api/admin/users")
+check("an ordinary member can't list everyone", s == 403, (s, r))
+s, r = admin.call("GET", "/api/admin/users")
+check("the admin can", s == 200, r)
+everyone = r["users"]
+check("the bot is left out of the list",
+      all(not u["tag"].startswith("Frontman") for u in everyone), everyone)
+me_row = [u for u in everyone if u["id"] == admin.uid][0]
+check("the admin's own row is marked", me_row["isYou"] is True, me_row)
+check("and flagged as an admin", me_row["isAdmin"] is True, me_row)
+theirs = [u for u in everyone if u["id"] == joiner.uid][0]
+check("the list carries the name given at sign-up",
+      theirs["fullName"] == "Alex Sawyer", theirs)
+check("and what would go with them",
+      "owns" in theirs and "messages" in theirs, theirs)
+
+s, r = admin.call("DELETE", f"/api/admin/users/{admin.uid}")
+check("the admin can't delete themselves", s == 400, (s, r))
+s, r = joiner.call("DELETE", f"/api/admin/users/{admin.uid}")
+check("nor can anyone else", s == 403, (s, r))
+
+# A member with a server of their own: it goes when they do.
+victim = signup("Doomed", "sgbye@x.com", "Going Away")[0]
+conn = sqlite3.connect(DB_PATH)
+conn.execute("UPDATE users SET approved = 1 WHERE id = ?", (victim.uid,))
+conn.commit()
+conn.close()
+_, g = victim.call("POST", "/api/guilds", {"name": "Their Server"})
+victim.call("POST", f"/api/channels/{g['channelId']}/messages", {"content": "hello"})
+
+_, r = admin.call("GET", "/api/admin/users")
+row = [u for u in r["users"] if u["id"] == victim.uid][0]
+check("their server is counted", row["owns"] == 1, row)
+check("and their messages", row["messages"] >= 1, row)
+
+s, r = admin.call("DELETE", f"/api/admin/users/{victim.uid}")
+check("the admin can delete an account", s == 200, (s, r))
+check("and is told what went", r["deleted"]["servers"] == 1, r["deleted"])
+
+_, r = admin.call("GET", "/api/admin/users")
+check("they are gone from the list",
+      not any(u["id"] == victim.uid for u in r["users"]), r["users"])
+s, r = victim.call("GET", "/api/me")
+check("their session no longer signs anybody in", not r.get("user"), r)
+s, r = victim.call("POST", "/api/login",
+                   {"email": "sgbye@x.com", "password": "hunter2hunter2"})
+check("and the account can't sign back in", s == 401, (s, r))
+s, r = admin.call("DELETE", f"/api/admin/users/{victim.uid}")
+check("deleting a ghost is refused", s == 404, (s, r))
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED: " + ", ".join(FAIL))

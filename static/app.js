@@ -4777,6 +4777,22 @@ $('#me-settings').onclick = () => {
     colorLabel.appendChild(colorInput);
     form.appendChild(colorLabel);
 
+    // Administrators get the keys to the site from their own settings.
+    if (state.me.isAdmin) {
+      const adminBox = el('div', 'admin-strip');
+      const text = el('div');
+      text.appendChild(el('strong', null, 'Administrator'));
+      text.appendChild(el('small', null,
+        'You approve new sign-ups and can remove accounts.'));
+      adminBox.appendChild(text);
+      const open = el('button', 'btn small');
+      open.type = 'button';
+      open.textContent = 'Manage members';
+      open.onclick = () => { close(); adminMembers(); };
+      adminBox.appendChild(open);
+      form.appendChild(adminBox);
+    }
+
     const actions = el('div', 'modal-actions');
     const cancel = el('button', 'btn ghost', 'Cancel');
     cancel.type = 'button';
@@ -4825,6 +4841,77 @@ function renderMe() {
   const sub = $('#me-tag');
   sub.textContent = state.me.status || `#${state.me.discriminator}`;
   sub.title = state.me.status ? `${state.me.status} · ${state.me.tag}` : state.me.tag;
+}
+
+// ------------------------------------------------------- administration
+
+/** Every account on the site, with the power to remove one. Admins only. */
+async function adminMembers() {
+  let data;
+  try { data = await api('GET', '/api/admin/users'); }
+  catch (err) { return toast(err.message, 'error'); }
+
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Members of Nexus'));
+    const waiting = data.users.filter((u) => !u.approved).length;
+    box.appendChild(el('p', 'sub',
+      `${data.users.length} account${data.users.length === 1 ? '' : 's'}`
+      + `${waiting ? `, ${waiting} waiting for approval` : ''}. Removing one `
+      + 'takes everything they own with it.'));
+
+    const list = el('div', 'admin-list');
+    data.users.forEach((u) => {
+      const row = el('div', `admin-row ${u.approved ? '' : 'waiting'}`.trim());
+      row.appendChild(avatar(u));
+
+      const who = el('div', 'admin-who');
+      const line = el('div', 'admin-line');
+      line.appendChild(el('strong', null, u.fullName || u.username));
+      if (u.isAdmin) line.appendChild(el('span', 'admin-tag', 'ADMIN'));
+      if (!u.approved) line.appendChild(el('span', 'admin-tag waiting', 'WAITING'));
+      if (u.isYou) line.appendChild(el('span', 'admin-tag you', 'YOU'));
+      who.appendChild(line);
+      who.appendChild(el('small', null, `${u.tag} · ${u.email}`));
+      who.appendChild(el('small', 'muted',
+        `${u.owns} server${u.owns === 1 ? '' : 's'} owned · `
+        + `${u.messages.toLocaleString()} message${u.messages === 1 ? '' : 's'} · `
+        + `${u.coins.toLocaleString()} ${COIN}`));
+      row.appendChild(who);
+
+      const drop = el('button', 'btn small danger', 'Delete');
+      // Deleting yourself from here would lock the site out of its only
+      // administrator, so that door stays shut.
+      drop.disabled = u.isYou;
+      if (u.isYou) drop.title = 'You can\'t delete your own account here';
+      drop.onclick = () => confirmDeleteAccount(u, close);
+      row.appendChild(drop);
+      list.appendChild(row);
+    });
+    box.appendChild(list);
+  });
+}
+
+function confirmDeleteAccount(u, reopen) {
+  const losses = [];
+  if (u.owns) {
+    losses.push(`${u.owns} server${u.owns === 1 ? '' : 's'} they own, with every `
+      + 'channel and message inside');
+  }
+  if (u.messages) losses.push(`${u.messages.toLocaleString()} of their messages`);
+  losses.push('their balance, perks and record');
+
+  confirmModal(
+    `Delete ${u.fullName || u.username}?`,
+    `${u.tag} (${u.email}) will be removed for good, along with `
+    + `${losses.join(', ')}. Their images are deleted from disk too. This `
+    + 'cannot be undone.',
+    'Delete account',
+    async () => {
+      const data = await api('DELETE', `/api/admin/users/${u.id}`);
+      toast(`${data.deleted.tag} removed.`, 'ok');
+      await refreshAll();
+      adminMembers();                 // straight back to the list
+    });
 }
 
 // ------------------------------------------------------------------ boot
