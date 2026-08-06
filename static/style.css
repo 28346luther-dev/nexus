@@ -1140,3 +1140,27 @@ button { background:none; border:0; cursor:pointer; }
   .msg { padding-right:16px; }
   .friends-view { padding:16px; }
 }
+
+/* --------------------------------------------------- settings sliders */
+.slider-readout { display:flex; flex-direction:column; gap:2px; margin-bottom:10px; }
+.slider-readout strong { font-size:17px; }
+.slider-readout .muted { font-size:12.5px; }
+.slider-readout.off strong { color:var(--red); }
+.slider {
+  width:100%; appearance:none; height:6px; border-radius:3px;
+  background:linear-gradient(90deg, var(--green), var(--yellow), var(--red));
+  outline:none;
+}
+.slider::-webkit-slider-thumb {
+  appearance:none; width:20px; height:20px; border-radius:50%;
+  background:#fff; border:3px solid var(--bg-1); cursor:pointer;
+  box-shadow:0 2px 6px rgba(0,0,0,.5);
+}
+.slider::-moz-range-thumb {
+  width:20px; height:20px; border-radius:50%; background:#fff;
+  border:3px solid var(--bg-1); cursor:pointer;
+}
+.slider-ends {
+  display:flex; justify-content:space-between; margin-top:6px;
+  font-size:11.5px; color:var(--text-mute);
+}

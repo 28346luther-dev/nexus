@@ -208,6 +208,27 @@ server icon*, PNG/JPEG/GIF/WebP up to 2 MB), rename the server, remove members,
 and delete messages. Members can leave. New channels are added at the bottom of
 the list, and the order is shared with everyone in the server.
 
+**Channel settings** — *Server options → Channel settings*, owner only, one
+channel at a time. All three are off by default, so every channel that already
+exists carries on unchanged.
+
+| Setting | What it does |
+|---|---|
+| Slow mode | How long a member waits between messages, off through to 6 hours. The owner is exempt |
+| Polls only | Nothing but polls can be posted. Nobody is exempt, owner included — it describes what the channel is *for* |
+| No bots | Keeps the Frontman out, so no games and no cards. Checked before a stake is taken, so a refused game costs nothing |
+
+Slow mode covers images and polls too, since both are messages. The rules show
+in the channel's topic line and the composer's placeholder, so nobody has to
+discover them by being refused.
+
+**Frontman usage** — *Server options → Frontman usage*, a server-wide slider
+from **Instantly** through **once an hour** to **Not at this time**, which puts
+the bot off duty entirely. It covers every game and card in every channel at
+once; the owner is exempt from the cooldown but not from off duty. Each card
+the Frontman posts records who asked for it, so the limit needs no bookkeeping
+of its own.
+
 **Invite codes** — 8-character codes, optionally limited by number of uses or an
 expiry. Share the bare code or a full `/invite/<code>` link. Codes can be
 revoked by the owner.

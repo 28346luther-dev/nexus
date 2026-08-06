@@ -49,6 +49,7 @@ addresses and will collide with themselves otherwise.
 |---|---|
 | `test_rules.py` | Game rules and wage maths, no server needed |
 | `test_signup_approval.py` | The approval queue — needs its own gated server |
+| `test_channel_settings.py` | Slow mode, polls only, no bots, Frontman usage |
 | `test_betting.py` | Poker check/call/raise, blackjack split and double, roulette |
 | `test_shop_polls_mutes.py` | The shop and perks, the Sana Lounge, `/work`, `/reset`, mutes, polls |
 | `test_poker.py` | Tables, seating, hole-card secrecy, showdown payouts |

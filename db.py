@@ -815,6 +815,15 @@ SHOP_BY_ID = {item["id"]: item for item in SHOP_ITEMS}
 
 LOUNGE_CHANNEL = "sana-lounge"
 
+# Slow-mode steps, in seconds. Familiar ladder, capped at six hours.
+SLOW_MODE_STEPS = (0, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 21600)
+MAX_SLOW_MODE = SLOW_MODE_STEPS[-1]
+
+# How often the Frontman may be called on, from no limit to off duty.
+BOT_OFF_DUTY = -1
+BOT_COOLDOWN_STEPS = (0, 5, 10, 30, 60, 120, 300, 600, 900, 1800, 3600, BOT_OFF_DUTY)
+MAX_BOT_COOLDOWN = 3600
+
 
 def perks_for(conn, user_id):
     """The set of shop items this player owns."""
@@ -1075,6 +1084,15 @@ def migrate(conn):
         conn.execute("ALTER TABLE users ADD COLUMN sawers_paid INTEGER NOT NULL DEFAULT 0")
 
     have = {r["name"] for r in conn.execute("PRAGMA table_info(channels)")}
+    if "slow_mode" not in have:
+        # Per-channel rules the owner sets. All default to off, so every
+        # channel that already exists carries on exactly as it did.
+        # slow_mode: seconds a member must wait between messages, 0 for off.
+        conn.execute("ALTER TABLE channels ADD COLUMN slow_mode INTEGER NOT NULL DEFAULT 0")
+        # polls_only: nothing but polls may be posted here.
+        conn.execute("ALTER TABLE channels ADD COLUMN polls_only INTEGER NOT NULL DEFAULT 0")
+        # no_bots: the Frontman keeps out, so no games and no cards.
+        conn.execute("ALTER TABLE channels ADD COLUMN no_bots INTEGER NOT NULL DEFAULT 0")
     if "locked" not in have:
         # 0 for an ordinary channel; otherwise the shop perk that unlocks it.
         conn.execute("ALTER TABLE channels ADD COLUMN locked TEXT NOT NULL DEFAULT ''")
@@ -1088,6 +1106,11 @@ def migrate(conn):
         )
 
     have = {r["name"] for r in conn.execute("PRAGMA table_info(guilds)")}
+    if "bot_cooldown" not in have:
+        # How often a member may call on the Frontman here. 0 is no limit,
+        # -1 puts it off duty entirely. Defaults to 0, so nothing changes for
+        # a server that already exists.
+        conn.execute("ALTER TABLE guilds ADD COLUMN bot_cooldown INTEGER NOT NULL DEFAULT 0")
     if "icon" not in have:
         # Stored upload name, or NULL to fall back to the coloured initials.
         conn.execute("ALTER TABLE guilds ADD COLUMN icon TEXT")

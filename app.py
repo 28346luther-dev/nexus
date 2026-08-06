@@ -196,6 +196,181 @@ def channel_access_or_403(req, channel_id):
     return ch
 
 
+# ----------------------------------------------------- per-channel rules
+
+def channel_setting(channel, name):
+    """One of the owner's channel rules, 0 on a channel predating them."""
+    keys = channel.keys()
+    return channel[name] if name in keys and channel[name] else 0
+
+
+def channel_rules(channel):
+    return {
+        "slowMode": channel_setting(channel, "slow_mode"),
+        "pollsOnly": bool(channel_setting(channel, "polls_only")),
+        "noBots": bool(channel_setting(channel, "no_bots")),
+    }
+
+
+def is_guild_owner(conn, channel, user_id):
+    if channel["kind"] != "text":
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM guilds WHERE id = ? AND owner_id = ?",
+        (channel["guild_id"], user_id),
+    ).fetchone()
+    return bool(row)
+
+
+def slow_mode_or_429(req, channel):
+    """Hold someone to the channel's cooldown.
+
+    The owner is exempt — slow mode is there to stop a channel running away
+    from the people reading it, and the person who set it is the one who has
+    to be able to step in and say so.
+    """
+    wait = channel_setting(channel, "slow_mode")
+    if not wait or is_guild_owner(req.conn, channel, req.user["id"]):
+        return
+    last = req.conn.execute(
+        "SELECT MAX(created_at) t FROM messages WHERE channel_id = ? AND author_id = ?",
+        (channel["id"], req.user["id"]),
+    ).fetchone()["t"]
+    if not last:
+        return
+    left = wait - (db.now() - last)
+    if left > 0:
+        raise HttpError(
+            429,
+            f"Slow mode is on here — {wait_text(left)} to go."
+            if left >= 60 else
+            f"Slow mode is on here — {left}s to go.",
+        )
+
+
+def polls_only_or_403(req, channel):
+    """A polls-only channel takes polls and nothing else.
+
+    Nobody is exempt, the owner included: this describes what the channel is
+    for rather than punishing anyone, and an owner who wants to talk here can
+    turn it off in the same dialog they turned it on.
+    """
+    if channel_setting(channel, "polls_only"):
+        raise HttpError(403, "Only polls can be posted in this channel.")
+
+
+def bot_channel_or_403(req, channel_id):
+    """Channel access, plus the rule about whether the Frontman may post.
+
+    Checked before a stake is taken or a card is built, so a refused game
+    never costs anybody anything.
+    """
+    ch = channel_access_or_403(req, channel_id)
+    if channel_setting(ch, "no_bots"):
+        raise HttpError(403, "The Frontman is not allowed in this channel.")
+    bot_limit_or_429(req, ch)
+    return ch
+
+
+def bot_limit_or_429(req, channel):
+    """Hold a member to the server's limit on calling the Frontman.
+
+    Every card it posts leaves a games row naming who asked for it, so the
+    last time they used it is a lookup rather than a column to keep in step.
+    The owner is exempt, as with slow mode.
+    """
+    if channel["kind"] != "text":
+        return
+    guild = req.conn.execute(
+        "SELECT bot_cooldown, owner_id FROM guilds WHERE id = ?",
+        (channel["guild_id"],),
+    ).fetchone()
+    if not guild:
+        return
+    limit = guild["bot_cooldown"]
+    if limit == db.BOT_OFF_DUTY:
+        raise HttpError(403, "The Frontman is off duty in this server.")
+    if limit <= 0 or guild["owner_id"] == req.user["id"]:
+        return
+    last = req.conn.execute(
+        "SELECT MAX(g.created_at) t FROM games g"
+        " JOIN channels c ON c.id = g.channel_id"
+        " WHERE c.guild_id = ? AND g.host_id = ?",
+        (channel["guild_id"], req.user["id"]),
+    ).fetchone()["t"]
+    if not last:
+        return
+    left = limit - (db.now() - last)
+    if left > 0:
+        raise HttpError(
+            429,
+            f"The Frontman is busy — {wait_text(left) if left >= 60 else f'{left}s'} to go.",
+        )
+
+
+@route("PATCH", r"/api/guilds/(\d+)/settings")
+def api_guild_settings(req, guild_id):
+    """Server-wide settings. Just the Frontman's limit for now."""
+    req.require_auth()
+    guild_id = int(guild_id)
+    owner_only(req, guild_id)
+    if "frontmanCooldown" in req.body:
+        try:
+            wait = int(req.body["frontmanCooldown"])
+        except (TypeError, ValueError):
+            raise HttpError(400, "That isn't a number of seconds.")
+        # Only the slider's own steps: a value between them would display as
+        # whichever notch is nearest and quietly disagree with the setting.
+        if wait not in db.BOT_COOLDOWN_STEPS:
+            raise HttpError(400, "Pick a limit from the slider.")
+        with req.conn:
+            req.conn.execute(
+                "UPDATE guilds SET bot_cooldown = ? WHERE id = ?", (wait, guild_id)
+            )
+    g = req.conn.execute("SELECT * FROM guilds WHERE id = ?", (guild_id,)).fetchone()
+    return {"guild": {"id": guild_id, "frontmanCooldown": g["bot_cooldown"]}}
+
+
+@route("PATCH", r"/api/channels/(\d+)/settings")
+def api_channel_settings(req, channel_id):
+    """The owner's per-channel rules."""
+    req.require_auth()
+    channel_id = int(channel_id)
+    ch = req.conn.execute(
+        "SELECT * FROM channels WHERE id = ?", (channel_id,)
+    ).fetchone()
+    if not ch or ch["kind"] != "text":
+        raise HttpError(404, "Channel not found.")
+    owner_only(req, ch["guild_id"])
+
+    fields, values = [], []
+    if "slowMode" in req.body:
+        try:
+            wait = int(req.body["slowMode"])
+        except (TypeError, ValueError):
+            raise HttpError(400, "Slow mode is a number of seconds.")
+        if wait < 0 or wait > db.MAX_SLOW_MODE:
+            raise HttpError(400, f"Slow mode goes up to {db.MAX_SLOW_MODE:,} seconds.")
+        fields.append("slow_mode = ?")
+        values.append(wait)
+    if "pollsOnly" in req.body:
+        fields.append("polls_only = ?")
+        values.append(1 if req.body["pollsOnly"] else 0)
+    if "noBots" in req.body:
+        fields.append("no_bots = ?")
+        values.append(1 if req.body["noBots"] else 0)
+    if fields:
+        values.append(channel_id)
+        with req.conn:
+            req.conn.execute(
+                f"UPDATE channels SET {', '.join(fields)} WHERE id = ?", values
+            )
+    fresh = req.conn.execute(
+        "SELECT * FROM channels WHERE id = ?", (channel_id,)
+    ).fetchone()
+    return {"channel": {"id": channel_id, "name": fresh["name"], **channel_rules(fresh)}}
+
+
 def locked_of(channel):
     """Which perk unlocks this channel, or '' for an ordinary one."""
     keys = channel.keys()
@@ -817,6 +992,7 @@ def api_guilds(req):
                 "iconUrl": f"/uploads/{g['icon']}" if g["icon"] else None,
                 "ownerId": g["owner_id"],
                 "isOwner": g["owner_id"] == uid,
+                "frontmanCooldown": g["bot_cooldown"],
                 "memberCount": req.conn.execute(
                     "SELECT COUNT(*) c FROM guild_members WHERE guild_id = ?", (g["id"],)
                 ).fetchone()["c"],
@@ -827,6 +1003,7 @@ def api_guilds(req):
                         "topic": c["topic"],
                         "locked": locked_of(c),
                         "muted": c["id"] in muted,
+                        **channel_rules(c),
                         "unread": unread_count(req.conn, uid, c["id"]),
                         "mentions": mention_count(req.conn, uid, c["id"]),
                     }
@@ -1127,7 +1304,10 @@ def api_upload_attachment(req, channel_id):
     """
     req.require_auth()
     channel_id = int(channel_id)
-    channel_access_or_403(req, channel_id)
+    ch = channel_access_or_403(req, channel_id)
+    # An image is a message: it obeys the same channel rules as one.
+    polls_only_or_403(req, ch)
+    slow_mode_or_429(req, ch)
 
     data, kind = read_image_or_400(req, images.MAX_UPLOAD)
     original = (req.query.get("filename", [""])[0] or f"image.{kind}")[:120]
@@ -1466,6 +1646,8 @@ def api_send_message(req, channel_id):
     req.require_auth()
     channel_id = int(channel_id)
     ch = channel_access_or_403(req, channel_id)
+    polls_only_or_403(req, ch)
+    slow_mode_or_429(req, ch)
 
     sticker_id = req.body.get("stickerId")
     if sticker_id:
@@ -1876,6 +2058,7 @@ def api_create_poll(req, channel_id):
     req.require_auth()
     channel_id = int(channel_id)
     ch = channel_access_or_403(req, channel_id)
+    slow_mode_or_429(req, ch)
 
     question = req.field("question", maxlen=MAX_POLL_QUESTION)
     raw = req.body.get("options")
@@ -2538,7 +2721,13 @@ def api_buy(req):
     # announces everything else it is asked to do.
     channel_id = req.body.get("channelId")
     if channel_id:
-        channel_access_or_403(req, int(channel_id))
+        # A channel that keeps the Frontman out gets no purchase card either;
+        # the perk is still bought, it just isn't announced there.
+        try:
+            bot_channel_or_403(req, int(channel_id))
+        except HttpError:
+            channel_id = None
+    if channel_id:
         me = req.conn.execute(
             "SELECT * FROM users WHERE id = ?", (req.user["id"],)
         ).fetchone()
@@ -3057,7 +3246,7 @@ def reuse_card(req, channel_id, game_id):
 def api_start_game(req, channel_id):
     req.require_auth()
     channel_id = int(channel_id)
-    ch = channel_access_or_403(req, channel_id)
+    ch = bot_channel_or_403(req, channel_id)
     mode = (req.body.get("mode") or "cpu").lower()
     if mode not in ("cpu", "pvp"):
         raise HttpError(400, "Pick either 'cpu' or 'pvp'.")
@@ -3226,7 +3415,7 @@ def api_frontman_card(req, channel_id):
     """The Frontman answers /claim, /balance, /bank and /leaderboard in-channel."""
     req.require_auth()
     channel_id = int(channel_id)
-    ch = channel_access_or_403(req, channel_id)
+    ch = bot_channel_or_403(req, channel_id)
     kind = (req.body.get("kind") or "").lower()
 
     if kind == "claim":
@@ -3307,7 +3496,7 @@ def api_start_poker(req, channel_id):
     """Open a poker table. Everyone antes the same amount to sit down."""
     req.require_auth()
     channel_id = int(channel_id)
-    ch = channel_access_or_403(req, channel_id)
+    ch = bot_channel_or_403(req, channel_id)
     if ch["kind"] == "dm":
         raise HttpError(400, "Poker needs a server channel so others can join.")
 
@@ -3509,7 +3698,7 @@ def api_slots(req, channel_id):
     """One pull of the slot machine, posted by the bot."""
     req.require_auth()
     channel_id = int(channel_id)
-    channel_access_or_403(req, channel_id)
+    bot_channel_or_403(req, channel_id)
 
     bet = take_bet(req, req.body.get("bet"))
     if bet < 10:
@@ -3552,7 +3741,7 @@ def api_roulette(req, channel_id):
     """One spin of the wheel, posted by the bot."""
     req.require_auth()
     channel_id = int(channel_id)
-    channel_access_or_403(req, channel_id)
+    bot_channel_or_403(req, channel_id)
 
     kind = (req.body.get("kind") or "").lower()
     pick = req.body.get("number")
@@ -3623,7 +3812,7 @@ def api_beg(req, channel_id):
     """Cap in hand. The house rarely pays; the other players might."""
     req.require_auth()
     channel_id = int(channel_id)
-    channel_access_or_403(req, channel_id)
+    bot_channel_or_403(req, channel_id)
 
     row = req.conn.execute(
         "SELECT last_beg FROM users WHERE id = ?", (req.user["id"],)
@@ -3837,6 +4026,7 @@ def api_channel_info(req, channel_id):
             "name": ch["name"],
             "topic": ch["topic"],
             "guildId": ch["guild_id"],
+            **channel_rules(ch),
         }
     }
 

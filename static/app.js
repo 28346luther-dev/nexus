@@ -1975,6 +1975,28 @@ function friendRow(f, kind) {
 
 // ------------------------------------------------------------------ navigation
 
+/** Say what a channel's rules are, in the topic line and the composer, so
+    nobody discovers them by being refused. */
+function paintChannelRules() {
+  const ch = state.activeChannel;
+  if (!ch || ch.kind !== 'text') return;
+  const notes = [];
+  if (ch.slowMode) {
+    const step = SLOW_STEPS.find(([s]) => s === ch.slowMode);
+    notes.push(`Slow mode: ${step ? step[1].toLowerCase() : `${ch.slowMode}s`}`);
+  }
+  if (ch.pollsOnly) notes.push('Polls only');
+  if (ch.noBots) notes.push('No bots');
+
+  const topic = $('#channel-topic');
+  topic.textContent = [ch.topic, notes.join(' · ')].filter(Boolean).join(' — ');
+
+  const input = $('#composer-input');
+  if (ch.pollsOnly) input.placeholder = `Only polls can be posted in #${ch.name}`;
+  else if (ch.slowMode) input.placeholder = `Message #${ch.name} — slow mode is on`;
+  else input.placeholder = `Message #${ch.name}`;
+}
+
 function setMobileView(inChannel) {
   document.getElementById('app').classList.toggle('viewing-channel', inChannel);
 }
@@ -2039,6 +2061,7 @@ async function openChannel(channelId) {
     $('#channel-topic').textContent = ch.topic || '';
     $('#invite-btn').hidden = false;
     $('#composer-input').placeholder = `Message #${ch.name}`;
+    paintChannelRules();
   }
 
   try {
@@ -3783,6 +3806,14 @@ $('#guild-menu-btn').onclick = () => {
       chan.onclick = () => { close(); promptCreateChannel(guild.id); };
       stack.appendChild(chan);
 
+      const bot = el('button', 'btn', 'Frontman usage');
+      bot.onclick = () => { close(); frontmanUsage(guild.id); };
+      stack.appendChild(bot);
+
+      const chanSettings = el('button', 'btn', 'Channel settings');
+      chanSettings.onclick = () => { close(); channelSettings(guild.id); };
+      stack.appendChild(chanSettings);
+
       const stick = el('button', 'btn', 'Manage stickers');
       stick.onclick = () => { close(); manageStickers(guild.id); };
       stack.appendChild(stick);
@@ -3829,6 +3860,200 @@ $('#guild-menu-btn').onclick = () => {
     box.appendChild(stack);
   });
 };
+
+// Left to right: no limit through to off entirely. -1 is off duty.
+const BOT_STEPS = [
+  [0, 'Instantly', 'No limit at all.'],
+  [5, 'Every 5 seconds', 'Barely a pause.'],
+  [10, 'Every 10 seconds', 'Enough to stop double-clicks.'],
+  [30, 'Every 30 seconds', 'A breather between hands.'],
+  [60, 'Every minute', 'Keeps a channel readable.'],
+  [120, 'Every 2 minutes', 'Games become an occasional thing.'],
+  [300, 'Every 5 minutes', 'A few hands an hour.'],
+  [600, 'Every 10 minutes', 'Rationed.'],
+  [900, 'Every 15 minutes', 'Rare.'],
+  [1800, 'Every 30 minutes', 'Twice an hour, at most.'],
+  [3600, 'Once an hour', 'Strictly special occasions.'],
+  [-1, 'Not at this time', 'The Frontman is off duty. No games, no cards.'],
+];
+
+/** How often members may call on the Frontman, server-wide. */
+function frontmanUsage(guildId) {
+  const guild = state.guilds.find((g) => g.id === guildId);
+  if (!guild) return;
+  let index = Math.max(0, BOT_STEPS.findIndex(
+    ([secs]) => secs === (guild.frontmanCooldown || 0)));
+
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Frontman usage'));
+    box.appendChild(el('p', 'sub',
+      'How often each member can call on the Frontman in this server. You are '
+      + 'exempt, and it applies to every channel at once.'));
+
+    const readout = el('div', 'slider-readout');
+    const value = el('strong');
+    const hint = el('span', 'muted');
+    readout.append(value, hint);
+    box.appendChild(readout);
+
+    const slider = el('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = String(BOT_STEPS.length - 1);
+    slider.step = '1';
+    slider.value = String(index);
+    slider.className = 'slider';
+    box.appendChild(slider);
+
+    const ends = el('div', 'slider-ends');
+    ends.append(el('span', null, 'No limit'), el('span', null, 'Off duty'));
+    box.appendChild(ends);
+
+    const paint = () => {
+      const [, label, note] = BOT_STEPS[Number(slider.value)];
+      value.textContent = label;
+      hint.textContent = note;
+      readout.classList.toggle('off', BOT_STEPS[Number(slider.value)][0] === -1);
+    };
+    slider.oninput = paint;
+    paint();
+
+    const actions = el('div', 'modal-actions');
+    const cancel = el('button', 'btn ghost', 'Cancel');
+    cancel.onclick = close;
+    const save = el('button', 'btn primary', 'Save');
+    save.onclick = async () => {
+      save.disabled = true;
+      const [secs, label] = BOT_STEPS[Number(slider.value)];
+      try {
+        await api('PATCH', `/api/guilds/${guildId}/settings`,
+          { frontmanCooldown: secs });
+        guild.frontmanCooldown = secs;
+        close();
+        toast(`Frontman usage: ${label.toLowerCase()}.`, 'ok');
+      } catch (err) { toast(err.message, 'error'); save.disabled = false; }
+    };
+    actions.append(cancel, save);
+    box.appendChild(actions);
+  });
+}
+
+// Seconds, and what to call them. Matches the ladder the server accepts.
+const SLOW_STEPS = [
+  [0, 'Off'], [5, '5 seconds'], [10, '10 seconds'], [15, '15 seconds'],
+  [30, '30 seconds'], [60, '1 minute'], [120, '2 minutes'], [300, '5 minutes'],
+  [600, '10 minutes'], [900, '15 minutes'], [1800, '30 minutes'],
+  [3600, '1 hour'], [21600, '6 hours'],
+];
+
+/** Per-channel rules, owner only. One channel at a time. */
+function channelSettings(guildId, channelId) {
+  const guild = state.guilds.find((g) => g.id === guildId);
+  if (!guild) return;
+  // The lounge is bought, not administered; leave it out of the list.
+  const channels = guild.channels.filter((c) => !c.locked);
+  if (!channels.length) return toast('No channels to configure.', 'error');
+  let current = channels.find((c) => c.id === channelId) || channels[0];
+
+  openModal((box, close) => {
+    box.appendChild(el('h2', null, 'Channel settings'));
+    box.appendChild(el('p', 'sub',
+      'Rules for one channel at a time. Everything here is off by default.'));
+
+    const pick = el('label', 'field');
+    pick.appendChild(el('span', null, 'Channel'));
+    const select = el('select');
+    channels.forEach((c) => {
+      const opt = el('option', null, `#${c.name}`);
+      opt.value = String(c.id);
+      if (c.id === current.id) opt.selected = true;
+      select.appendChild(opt);
+    });
+    pick.appendChild(select);
+    box.appendChild(pick);
+
+    const panel = el('div');
+    box.appendChild(panel);
+
+    const save = async (patch) => {
+      try {
+        const data = await api('PATCH', `/api/channels/${current.id}/settings`, patch);
+        Object.assign(current, data.channel);
+        // The open channel's own copy drives the composer hint.
+        if (state.activeChannel && state.activeChannel.id === current.id) {
+          Object.assign(state.activeChannel, data.channel);
+          paintChannelRules();
+        }
+        return true;
+      } catch (err) { toast(err.message, 'error'); return false; }
+    };
+
+    const draw = () => {
+      panel.replaceChildren();
+
+      const slow = el('label', 'field');
+      slow.appendChild(el('span', null, 'Slow mode'));
+      const slowSelect = el('select');
+      SLOW_STEPS.forEach(([secs, label]) => {
+        const opt = el('option', null, label);
+        opt.value = String(secs);
+        if (secs === (current.slowMode || 0)) opt.selected = true;
+        slowSelect.appendChild(opt);
+      });
+      slowSelect.onchange = async () => {
+        const secs = Number(slowSelect.value);
+        if (await save({ slowMode: secs })) {
+          toast(secs ? `Slow mode: one message every ${SLOW_STEPS
+            .find(([s]) => s === secs)[1].toLowerCase()}.` : 'Slow mode off.', 'ok');
+        }
+      };
+      slow.appendChild(slowSelect);
+      slow.appendChild(el('small', null,
+        'How long a member waits between messages. You are exempt.'));
+      panel.appendChild(slow);
+
+      panel.appendChild(toggleRow(
+        'Polls only', current.pollsOnly,
+        'Nothing but polls can be posted. Applies to you too — turn it off to talk.',
+        (on) => save({ pollsOnly: on })));
+
+      panel.appendChild(toggleRow(
+        'No bots', current.noBots,
+        'Keeps the Frontman out, so no games and no cards in here.',
+        (on) => save({ noBots: on })));
+    };
+
+    select.onchange = () => {
+      current = channels.find((c) => c.id === Number(select.value));
+      draw();
+    };
+    draw();
+
+    const actions = el('div', 'modal-actions');
+    const done = el('button', 'btn primary', 'Done');
+    done.onclick = () => { close(); refreshAll(); };
+    actions.appendChild(done);
+    box.appendChild(actions);
+  });
+}
+
+/** A labelled switch that saves the moment it is flipped. */
+function toggleRow(title, on, hint, onChange) {
+  const label = el('label', 'field toggle-field');
+  const box = el('input');
+  box.type = 'checkbox';
+  box.checked = !!on;
+  box.onchange = async () => {
+    const ok = await onChange(box.checked);
+    if (!ok) box.checked = !box.checked;
+  };
+  label.appendChild(box);
+  const text = el('div');
+  text.appendChild(el('strong', null, title));
+  text.appendChild(el('small', null, hint));
+  label.appendChild(text);
+  return label;
+}
 
 function promptServerIcon(guild) {
   openModal((box, close) => {
